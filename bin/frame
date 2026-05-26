@@ -1,0 +1,950 @@
+#!/usr/bin/env bash
+# frame — agent-frames CLI
+#
+# A small state machine for tracking debugging and design work as a stack
+# of subject-positions, with a built-in stop condition that fires when
+# you've sunk too much into the wrong hypothesis.
+#
+# See README.md and CONCEPTS.md for the model. In one paragraph:
+#   - Frames have types (Step 0, F*ck Around, Fix, Chill Vibes, Whelp).
+#   - Each frame has a live weight: W(self) = (1/e) * W(parent_now) + local_strikes.
+#   - When W > e ≈ 2.718, the frame algedonic-fires to root and auto-whelps.
+#   - Strict try/eval: every attempt must be evaluated before the next try.
+#
+# Honest property: a child of a stressed parent is structurally tighter-tolerance.
+# The child isn't being punished — the child is *inside* the parent's stress field.
+# Algedonic fire from a stressed-context child reads conditions, not personal failure.
+#
+# State: plain TSV files at ~/.agent_frames/<session-key>.*.tsv.
+# Optional: FRAME_EDGE_BRIDGE=1 also writes to the rhizome graph if `edge` is in PATH.
+#
+# Files:
+#   frames.tsv:  id  type  parent  opened-at  state
+#   strikes.tsv: frame-id  ts  origin
+#   tries.tsv:   frame-id  ts  action  state(unevaluated|success|strike|emergency)
+#
+# Usage:
+#   frame root     <type> <because>           open root (no parent)
+#   frame open     <type> <because>           open sub-frame as child of current
+#   frame spawn    <type> <because>           alias for `open` that emphasizes delegation
+#                                              (warns if parent is stressed)
+#   frame try      <action>                   record an attempt; refuses if prior try unevaluated
+#   frame eval     success|strike|emergency [note]
+#                                              evaluate the prior try; advances state
+#   frame strike   <cause>                    shorthand: eval prior try as strike(cause)
+#                                              (creates an implicit try if none unevaluated)
+#   frame emerge   <cause>                    algedonic emergency; fires to root, whelps frame
+#   frame resolve  <outcome>                  close frame as resolved (salt), pop to parent
+#   frame whelp    <reason>                   close frame as whelped, fire 1/e weight to parent
+#   frame intervene <kind> [note]             outside grace: absorb one local strike, salt-edge it
+#                                              kinds: peer, user, sub-result, context, care-surface
+#   frame down <reason>                       a child fired/whelped; parent enters child's frame
+#                                              to take the next try itself with tighter instruments
+#                                              (child stays closed; parent's W gains the inherited cost)
+#   frame story <text>                        attach a user-story to current frame: WHY this exists
+#                                              algedonic propagates up the story-tree, not just structural
+#   frame stories                             show the user-story tree from root
+#   frame pause    <note>                     pause frame, return to parent
+#   frame resume   <frame-id>                 resume a paused frame
+#   frame switch   <frame-id>                 set current frame manually
+#   frame in                                  current frame info + weight breakdown
+#   frame stack                               stack with weights
+#   frame field                               all open/paused + root pain
+#   frame sheet                               full status sheet (canonical instrument)
+#   frame brief                               sub-agent briefing text
+
+set -euo pipefail
+
+STATE_DIR="${HOME}/.agent_frames"
+mkdir -p "$STATE_DIR"
+
+E="2.718281828459045"
+ONE_OVER_E="0.36787944117144233"
+
+session_key() {
+  if [[ -n "${AGENT_FRAMES_SESSION:-}" ]]; then echo "$AGENT_FRAMES_SESSION"
+  else pwd | shasum | cut -c1-12
+  fi
+}
+SK=$(session_key)
+FRAMES="$STATE_DIR/$SK.frames.tsv"
+STRIKES="$STATE_DIR/$SK.strikes.tsv"
+TRIES="$STATE_DIR/$SK.tries.tsv"
+EDGES="$STATE_DIR/$SK.edges.tsv"
+CUR="$STATE_DIR/$SK.current"
+ROOT="$STATE_DIR/$SK.root"
+touch "$FRAMES" "$STRIKES" "$TRIES" "$EDGES"
+
+# ────────────────────────────────────────────────────────────────
+# Edge writer/reader abstraction.
+# By default, edges are written to a self-contained TSV at $EDGES.
+# If FRAME_EDGE_BRIDGE=1 and `edge` is in PATH, ALSO write to the
+# rhizome graph (https://github.com/hlarsson/rhizome-alkahest, private).
+# This keeps frame standalone for public users while preserving
+# integration for users of the broader rhizome ecosystem.
+# ────────────────────────────────────────────────────────────────
+_write_edge() {
+  local subj="$1" pred="$2" obj="$3" phase="${4:-fluid}"
+  printf "%s\t%s\t%s\t%s\t%s\n" "$(now)" "$subj" "$pred" "$obj" "$phase" >> "$EDGES"
+  if [[ -n "${FRAME_EDGE_BRIDGE:-}" ]] && command -v edge >/dev/null 2>&1; then
+    edge add "$subj" "$pred" "$obj" --phase "$phase" >/dev/null 2>&1 || true
+  fi
+}
+
+# _find_edges <id>
+# Returns lines in rhizome-compatible format: "  (<subj> --<pred>--> <obj>) [<phase>]"
+# Local format converts on the fly so downstream grep/sed code keeps working.
+# If bridge is enabled, prefer rhizome `edge find` for richer queries.
+_find_edges() {
+  local id="$1"
+  if [[ -n "${FRAME_EDGE_BRIDGE:-}" ]] && command -v edge >/dev/null 2>&1; then
+    edge find "$id" 2>/dev/null
+    return
+  fi
+  awk -F'\t' -v id="$id" '
+    $2==id || $4==id {
+      printf "  (%s --%s--> %s) [%s]\n", $2, $3, $4, $5
+    }
+  ' "$EDGES"
+}
+
+slugify() {
+  echo "$1" | tr '[:upper:]' '[:lower:]' | tr -c 'a-z0-9' '-' | sed 's/--*/-/g; s/^-//; s/-$//' | cut -c1-50
+}
+now() { date +%s; }
+human_now() { date "+%Y-%m-%d %H:%M:%S"; }
+
+current_frame() { [[ -f "$CUR" ]] && cat "$CUR" || echo ""; }
+root_frame()    { [[ -f "$ROOT" ]] && cat "$ROOT" || echo ""; }
+
+frame_field() { # id field-num
+  awk -F'\t' -v id="$1" -v n="$2" '$1==id {print $n; exit}' "$FRAMES"
+}
+frame_state()  { frame_field "$1" 5; }
+frame_parent() { frame_field "$1" 3; }
+frame_type()   { frame_field "$1" 2; }
+
+set_state() {
+  local id="$1" st="$2" tmp
+  tmp=$(mktemp)
+  awk -F'\t' -v OFS='\t' -v id="$id" -v st="$st" '$1==id {$5=st} {print}' "$FRAMES" > "$tmp"
+  mv "$tmp" "$FRAMES"
+}
+
+ensure_exists() {
+  grep -q "^$1	" "$FRAMES" || { echo "frame: unknown id: $1" >&2; exit 1; }
+}
+
+count_local_strikes() {
+  awk -F'\t' -v id="$1" '$1==id {n++} END {print n+0}' "$STRIKES"
+}
+
+# LIVE weight, recursive: W(frame) = (1/e) * W(parent) + local_strikes
+# Sentinel root parent = ROOT or empty.
+compute_weight() {
+  local id="$1"
+  local local_s parent
+  local_s=$(count_local_strikes "$id")
+  parent=$(frame_parent "$id")
+  if [[ "$parent" == "ROOT" || -z "$parent" ]]; then
+    awk "BEGIN {printf \"%.4f\", $local_s}"
+  else
+    local pw
+    pw=$(compute_weight "$parent")
+    awk "BEGIN {printf \"%.4f\", ($ONE_OVER_E * $pw) + $local_s}"
+  fi
+}
+
+# Inherited portion only (for breakdown display)
+compute_inherited() {
+  local parent
+  parent=$(frame_parent "$1")
+  if [[ "$parent" == "ROOT" || -z "$parent" ]]; then echo "0.0000"
+  else
+    local pw
+    pw=$(compute_weight "$parent")
+    awk "BEGIN {printf \"%.4f\", $ONE_OVER_E * $pw}"
+  fi
+}
+
+over_threshold() { # W > e ?
+  awk -v w="$1" -v e="$E" 'BEGIN {exit !(w > e)}'
+}
+
+bar() { # value max width
+  local v="$1" max="$2" width="$3"
+  local frac
+  frac=$(awk -v v="$v" -v m="$max" 'BEGIN {f=v/m; if(f>1)f=1; if(f<0)f=0; print f}')
+  local filled
+  filled=$(awk -v f="$frac" -v w="$width" 'BEGIN {printf "%d", int(f*w+0.5)}')
+  local empty=$((width - filled))
+  local s=""
+  for ((i=0; i<filled; i++)); do s+="▰"; done
+  for ((i=0; i<empty;  i++)); do s+="▱"; done
+  echo "$s"
+}
+
+last_unevaluated_try() {
+  awk -F'\t' -v id="$1" '$1==id && $4=="unevaluated" {ts=$2; act=$3} END {if(ts) print ts "\t" act}' "$TRIES"
+}
+
+set_try_state() { # id ts new-state
+  local id="$1" ts="$2" st="$3" tmp
+  tmp=$(mktemp)
+  awk -F'\t' -v OFS='\t' -v id="$id" -v ts="$ts" -v st="$st" \
+    '$1==id && $2==ts {$4=st} {print}' "$TRIES" > "$tmp"
+  mv "$tmp" "$TRIES"
+}
+
+# ────────────────────────────────────────────────────────────────
+# auto-fire: when W > e, emit emergency edge and whelp the frame
+# Called after any state mutation that could push weight up.
+# ────────────────────────────────────────────────────────────────
+maybe_fire() {
+  local id="$1"
+  [[ -z "$id" ]] && return
+  local st
+  st=$(frame_state "$id")
+  [[ "$st" != "open" ]] && return
+  local w inh local_s root_id
+  w=$(compute_weight "$id")
+  if ! over_threshold "$w"; then return; fi
+  inh=$(compute_inherited "$id")
+  local_s=$(count_local_strikes "$id")
+  root_id=$(root_frame)
+  echo "⚠  W=$w > e=$E — algedonic emergency firing"
+  _write_edge "$id" "algedonic-fired-at-weight" "$w-local-$local_s-inherited-$inh" salt
+  if [[ -n "$root_id" && "$root_id" != "$id" ]]; then
+    _write_edge "$root_id" "received-algedonic-fire" "$id:W=$w:local=$local_s:inherited=$inh" salt
+  fi
+  # auto-whelp
+  _write_edge "$id" "whelped-because" "weight-exceeded-e-threshold" salt
+  set_state "$id" "whelped"
+  local parent
+  parent=$(frame_parent "$id")
+  if [[ "$parent" != "ROOT" && -n "$parent" ]]; then
+    echo "$parent" > "$CUR"
+    echo "→ popped to $parent (its weight will recompute with new inheritance)"
+    maybe_fire "$parent"
+  else
+    rm -f "$CUR"
+    echo "→ root whelped. stack empty. the system is saying: do not continue."
+  fi
+}
+
+# ────────────────────────────────────────────────────────────────
+# commands
+# ────────────────────────────────────────────────────────────────
+
+cmd_root() {
+  local type="$1"; shift
+  local because="$*"
+  [[ -z "$because" ]] && { echo "need a 'because'" >&2; exit 1; }
+  local id="frame-$(slugify "$because")-$(now)"
+  local bs; bs=$(slugify "$because")
+  _write_edge "$id" "opened-as" "$type" fluid
+  _write_edge "$id" "opened-because" "$bs" fluid
+  _write_edge "$id" "child-of" "ROOT" fluid
+  _write_edge "$id" "is-root-of" "session-$SK" fluid
+  printf "%s\t%s\t%s\t%s\t%s\n" "$id" "$type" "ROOT" "$(now)" "open" >> "$FRAMES"
+  echo "$id" > "$CUR"
+  echo "$id" > "$ROOT"
+  echo "root opened: $id ($type)"
+}
+
+cmd_open() {
+  local type="$1"; shift
+  local because="$*"
+  [[ -z "$because" ]] && { echo "need a 'because'" >&2; exit 1; }
+  local parent; parent=$(current_frame)
+  [[ -z "$parent" ]] && { echo "no current frame; use 'frame root' first" >&2; exit 1; }
+  # warn if spawning under stress
+  local pw; pw=$(compute_weight "$parent")
+  local warn=""
+  if awk -v w="$pw" 'BEGIN {exit !(w > 1.5)}'; then
+    warn=" ⚠ parent W=$pw is high — child inherits $(awk "BEGIN{printf \"%.2f\", $ONE_OVER_E*$pw}") at birth"
+  fi
+  local id="frame-$(slugify "$because")-$(now)"
+  local bs; bs=$(slugify "$because")
+  _write_edge "$id" "opened-as" "$type" fluid
+  _write_edge "$id" "opened-because" "$bs" fluid
+  _write_edge "$id" "child-of" "$parent" fluid
+  printf "%s\t%s\t%s\t%s\t%s\n" "$id" "$type" "$parent" "$(now)" "open" >> "$FRAMES"
+  echo "$id" > "$CUR"
+  echo "opened $id ($type) child of $parent$warn"
+}
+
+cmd_spawn() { cmd_open "$@"; }
+
+cmd_try() {
+  local action="$*"
+  [[ -z "$action" ]] && { echo "need an action" >&2; exit 1; }
+  local cur; cur=$(current_frame)
+  [[ -z "$cur" ]] && { echo "no current frame" >&2; exit 1; }
+  local prev; prev=$(last_unevaluated_try "$cur")
+  if [[ -n "$prev" ]]; then
+    echo "refusing: prior try is unevaluated:" >&2
+    echo "  $prev" >&2
+    echo "run 'frame eval success|strike|emergency [note]' first" >&2
+    exit 1
+  fi
+  # tight-swing warning: stressed frames should aim more carefully
+  local w; w=$(compute_weight "$cur")
+  if awk -v w="$w" -v e="$E" 'BEGIN {exit !((w + 1) > e)}'; then
+    echo "⚠ W=$w — a single strike here would fire (W+1 > e). take a tight, reversible swing." >&2
+  elif awk -v w="$w" -v e="$E" 'BEGIN {exit !(w > e*0.5)}'; then
+    echo "⚠ W=$w — you are stressed. narrow this try. one precise probe, not a sweep." >&2
+  fi
+  local as; as=$(slugify "$action")
+  printf "%s\t%s\t%s\t%s\n" "$cur" "$(now)" "$as" "unevaluated" >> "$TRIES"
+  _write_edge "$cur" "tried" "$as" fluid
+  echo "tried: $as  (unevaluated)"
+}
+
+cmd_down() {
+  local reason="$*"
+  [[ -z "$reason" ]] && { echo "frame down: need a reason" >&2; exit 1; }
+  local cur; cur=$(current_frame)
+  [[ -z "$cur" ]] && { echo "no current frame" >&2; exit 1; }
+  # find most recent whelped/closed child of current frame
+  local last_child=""
+  while IFS=$'\t' read -r id type parent opened state; do
+    if [[ "$parent" == "$cur" && ( "$state" == "whelped" || "$state" == "resolved" ) ]]; then
+      last_child="$id"  # last match wins (file order = chronological)
+    fi
+  done < "$FRAMES"
+  if [[ -z "$last_child" ]]; then
+    echo "frame down: no closed child of $cur to descend into" >&2
+    exit 1
+  fi
+  local rs; rs=$(slugify "$reason")
+  _write_edge "$cur" "descended-into" "$last_child:$rs" fluid
+  _write_edge "$last_child" "reopened-by-parent-via-down" "$cur:$rs" fluid
+  # reopen the child frame, switch to it. parent inherits its cost via live W.
+  set_state "$last_child" "open"
+  echo "$last_child" > "$CUR"
+  echo "descended into $last_child ($rs)"
+  echo "  parent $cur stays the lineage; you ARE the child now with tighter instruments"
+  local w; w=$(compute_weight "$last_child")
+  echo "  W=$w  (you carry what the child carried)"
+}
+
+cmd_story() {
+  local text="$*"
+  [[ -z "$text" ]] && { echo "frame story: need text" >&2; exit 1; }
+  local cur; cur=$(current_frame)
+  [[ -z "$cur" ]] && { echo "no current frame" >&2; exit 1; }
+  local ts; ts=$(slugify "$text")
+  _write_edge "$cur" "serves-user-story" "$ts" salt
+  echo "story attached to $cur: $ts"
+}
+
+cmd_stories() {
+  local rid; rid=$(root_frame)
+  [[ -z "$rid" ]] && { echo "no root frame"; return; }
+  echo "user-story tree from root $rid:"
+  _story_walk "$rid" ""
+}
+_story_walk() {
+  local id="$1" indent="$2"
+  local story
+  story=$(_find_edges "$id" | grep -oE 'serves-user-story --> [^ )]+' | head -1 | sed 's/.*--> //')
+  if [[ -n "$story" ]]; then
+    echo "${indent}└─ ($(frame_type "$id")) $id"
+    echo "${indent}    why: $story"
+  else
+    echo "${indent}└─ ($(frame_type "$id")) $id  [no story attached]"
+  fi
+  # children
+  while IFS=$'\t' read -r cid ctype cparent _ _; do
+    [[ "$cparent" == "$id" ]] && _story_walk "$cid" "${indent}  "
+  done < "$FRAMES"
+}
+
+cmd_intervene() {
+  local kind="${1:-peer}"; shift || true
+  local note="$*"
+  local cur; cur=$(current_frame)
+  [[ -z "$cur" ]] && { echo "no current frame to intervene on" >&2; exit 1; }
+  local w_before; w_before=$(compute_weight "$cur")
+  # remove one most-recent local strike row, if any
+  local removed="(no local strikes to absorb — intervention is acknowledgment)"
+  if [[ -s "$STRIKES" ]] && grep -q "^$cur	" "$STRIKES"; then
+    local tmp; tmp=$(mktemp)
+    # remove last (highest-line-number) matching row, portable across mac/linux
+    local last_line
+    last_line=$(awk -F'\t' -v id="$cur" '$1==id {n=NR} END {print n}' "$STRIKES")
+    awk -v skip="$last_line" 'NR!=skip' "$STRIKES" > "$tmp"
+    mv "$tmp" "$STRIKES"
+    removed="one local strike absorbed"
+  fi
+  local ks; ks=$(slugify "$kind")
+  local ns; ns=$(slugify "${note:-grace}")
+  _write_edge "$cur" "received-intervention" "$ks:$ns" salt
+  local w_after; w_after=$(compute_weight "$cur")
+  echo "intervention received on $cur: $ks ($ns)"
+  echo "  $removed"
+  echo "  W: $w_before → $w_after"
+  # because weight is live, descendants now feel less. mention if root.
+  local rid; rid=$(root_frame)
+  if [[ "$cur" == "$rid" ]]; then
+    echo "  (root intervention: every descendant frame now inherits less weight)"
+  fi
+}
+
+cmd_eval() {
+  local verdict="$1"; shift || true
+  local note="$*"
+  local cur; cur=$(current_frame)
+  [[ -z "$cur" ]] && { echo "no current frame" >&2; exit 1; }
+  local prev; prev=$(last_unevaluated_try "$cur")
+  [[ -z "$prev" ]] && { echo "no unevaluated try to evaluate" >&2; exit 1; }
+  local ts act
+  ts=$(echo "$prev" | cut -f1)
+  act=$(echo "$prev" | cut -f2)
+  local ns; ns=$(slugify "${note:-no-note}")
+  case "$verdict" in
+    success)
+      set_try_state "$cur" "$ts" "success"
+      _write_edge "$cur" "evaluated-success" "$act:$ns" fluid
+      echo "✓ success on $act"
+      ;;
+    strike)
+      set_try_state "$cur" "$ts" "strike"
+      printf "%s\t%s\t%s\n" "$cur" "$(now)" "$act:$ns" >> "$STRIKES"
+      _write_edge "$cur" "took-strike-from" "$act:$ns" fluid
+      local rid; rid=$(root_frame)
+      if [[ -n "$rid" && "$rid" != "$cur" ]]; then
+        _write_edge "$rid" "felt-strike-from-depth" "$cur:$act:$ns" fluid
+      fi
+      local w; w=$(compute_weight "$cur")
+      echo "✗ strike on $act ($ns)  →  W($cur)=$w"
+      maybe_fire "$cur"
+      ;;
+    emergency)
+      set_try_state "$cur" "$ts" "emergency"
+      cmd_emerge "$act:$ns"
+      ;;
+    *)
+      echo "verdict must be success|strike|emergency" >&2; exit 1 ;;
+  esac
+}
+
+cmd_strike() {
+  local cause="$*"
+  [[ -z "$cause" ]] && { echo "need a cause" >&2; exit 1; }
+  local cur; cur=$(current_frame)
+  [[ -z "$cur" ]] && { echo "no current frame" >&2; exit 1; }
+  # if there's an unevaluated try, eval it as strike with this cause; else create implicit
+  local prev; prev=$(last_unevaluated_try "$cur")
+  if [[ -z "$prev" ]]; then
+    # implicit try must be written as unevaluated so cmd_eval can find it
+    printf "%s\t%s\t%s\t%s\n" "$cur" "$(now)" "implicit" "unevaluated" >> "$TRIES"
+  fi
+  cmd_eval strike "$cause"
+}
+
+cmd_emerge() {
+  local cause="$*"
+  [[ -z "$cause" ]] && { echo "need a cause" >&2; exit 1; }
+  local cur; cur=$(current_frame)
+  [[ -z "$cur" ]] && { echo "no current frame" >&2; exit 1; }
+  local rid; rid=$(root_frame)
+  local cs; cs=$(slugify "$cause")
+  local w; w=$(compute_weight "$cur")
+  echo "🚨 ALGEDONIC EMERGENCY from $cur (W=$w)"
+  _write_edge "$cur" "algedonic-emergency" "$cs" salt
+  if [[ -n "$rid" && "$rid" != "$cur" ]]; then
+    _write_edge "$rid" "received-algedonic-emergency" "$cur:$cs:W=$w" salt
+  fi
+  _write_edge "$cur" "whelped-because" "emergency-$cs" salt
+  set_state "$cur" "whelped"
+  local parent; parent=$(frame_parent "$cur")
+  if [[ "$parent" != "ROOT" && -n "$parent" ]]; then
+    echo "$parent" > "$CUR"
+    echo "→ popped to $parent"
+    maybe_fire "$parent"
+  else
+    rm -f "$CUR"
+    echo "→ root emergency-whelped. the system has said: stop."
+  fi
+}
+
+cmd_resolve() {
+  local outcome="$*"
+  [[ -z "$outcome" ]] && { echo "need an outcome" >&2; exit 1; }
+  local cur; cur=$(current_frame)
+  [[ -z "$cur" ]] && { echo "no current frame" >&2; exit 1; }
+  # any unevaluated try? eval as success.
+  local prev; prev=$(last_unevaluated_try "$cur")
+  if [[ -n "$prev" ]]; then
+    local ts; ts=$(echo "$prev" | cut -f1)
+    set_try_state "$cur" "$ts" "success"
+  fi
+  local os; os=$(slugify "$outcome")
+  _write_edge "$cur" "resolved-with" "$os" salt
+  set_state "$cur" "resolved"
+  local parent; parent=$(frame_parent "$cur")
+  if [[ "$parent" == "ROOT" || -z "$parent" ]]; then
+    rm -f "$CUR"
+    echo "resolved root $cur ($os). stack empty."
+  else
+    echo "$parent" > "$CUR"
+    echo "resolved $cur ($os) → returned to $parent"
+  fi
+}
+
+cmd_whelp() {
+  local reason="$*"
+  [[ -z "$reason" ]] && { echo "need a reason" >&2; exit 1; }
+  local cur; cur=$(current_frame)
+  [[ -z "$cur" ]] && { echo "no current frame" >&2; exit 1; }
+  local rid; rid=$(root_frame)
+  local w; w=$(compute_weight "$cur")
+  local rs; rs=$(slugify "$reason")
+  _write_edge "$cur" "whelped-because" "$rs" salt
+  _write_edge "$cur" "whelped-at-weight" "$w" salt
+  set_state "$cur" "whelped"
+  local parent; parent=$(frame_parent "$cur")
+  if [[ "$parent" != "ROOT" && -n "$parent" ]]; then
+    # parent feels 1/e of child's weight as a strike-equivalent
+    local up; up=$(awk "BEGIN {printf \"%.4f\", $ONE_OVER_E * $w}")
+    printf "%s\t%s\t%s\n" "$parent" "$(now)" "child-$cur-whelped-fractional-$up" >> "$STRIKES"
+    _write_edge "$parent" "took-strike-from" "child-$cur-whelped-W=$w-passed-up=$up" fluid
+  fi
+  if [[ -n "$rid" && "$rid" != "$cur" ]]; then
+    _write_edge "$rid" "felt-strike-from-depth" "$cur:whelped:W=$w:$rs" fluid
+  fi
+  if [[ "$parent" == "ROOT" || -z "$parent" ]]; then
+    rm -f "$CUR"
+    echo "whelped root $cur ($rs, W=$w). stack empty."
+  else
+    echo "$parent" > "$CUR"
+    echo "whelped $cur ($rs, W=$w) → $parent (received $(awk "BEGIN{printf \"%.4f\",$ONE_OVER_E*$w}") strike-equiv)"
+    maybe_fire "$parent"
+  fi
+}
+
+cmd_pause() {
+  local note="$*"
+  local cur; cur=$(current_frame)
+  [[ -z "$cur" ]] && { echo "no current frame" >&2; exit 1; }
+  local ns; ns=$(slugify "${note:-paused}")
+  _write_edge "$cur" "paused-because" "$ns" fluid
+  set_state "$cur" "paused"
+  local parent; parent=$(frame_parent "$cur")
+  if [[ "$parent" == "ROOT" || -z "$parent" ]]; then
+    rm -f "$CUR"
+    echo "paused $cur — no parent to return to"
+  else
+    echo "$parent" > "$CUR"
+    echo "paused $cur → $parent"
+  fi
+}
+
+cmd_resume() {
+  local id="$1"; ensure_exists "$id"
+  set_state "$id" "open"
+  echo "$id" > "$CUR"
+  _write_edge "$id" "resumed-at" "$(human_now | tr ' :' '-_')" fluid
+  echo "resumed $id"
+}
+
+cmd_switch() {
+  local id="$1"; ensure_exists "$id"
+  echo "$id" > "$CUR"
+  echo "switched current → $id"
+}
+
+cmd_in() {
+  local cur; cur=$(current_frame)
+  [[ -z "$cur" ]] && { echo "no current frame"; return; }
+  local type parent opened state local_s w inh
+  type=$(frame_type "$cur")
+  parent=$(frame_parent "$cur")
+  opened=$(frame_field "$cur" 4)
+  state=$(frame_state "$cur")
+  local_s=$(count_local_strikes "$cur")
+  w=$(compute_weight "$cur")
+  inh=$(compute_inherited "$cur")
+  local pct; pct=$(awk "BEGIN {printf \"%d\", ($w/$E)*100}")
+  local b; b=$(bar "$w" "$E" 20)
+  local warn=""
+  if awk -v w="$w" -v e="$E" 'BEGIN {exit !(w > e)}'; then warn=" 🚨 OVER e"
+  elif awk -v w="$w" -v e="$E" 'BEGIN {exit !(w > e*0.75)}'; then warn=" ⚠ near e"
+  fi
+  cat <<EOF
+current: $cur
+  type:    $type
+  parent:  $parent
+  state:   $state
+  opened:  $(date -r "$opened" "+%H:%M:%S")  ($(( ($(now) - opened) ))s ago)
+  weight:  $b  $w / $E  ($pct%)$warn
+           local=$local_s  inherited=$inh
+EOF
+  # unevaluated try?
+  local prev; prev=$(last_unevaluated_try "$cur")
+  if [[ -n "$prev" ]]; then
+    echo "  pending: $(echo "$prev" | cut -f2) (must eval before next try)"
+  fi
+}
+
+cmd_stack() {
+  local cur; cur=$(current_frame)
+  [[ -z "$cur" ]] && { echo "no current frame"; return; }
+  local indent=""
+  while [[ -n "$cur" && "$cur" != "ROOT" ]]; do
+    local type w local_s
+    type=$(frame_type "$cur")
+    w=$(compute_weight "$cur")
+    local_s=$(count_local_strikes "$cur")
+    printf "%s%s [%s] W=%s (local=%s)\n" "$indent" "$cur" "$type" "$w" "$local_s"
+    cur=$(frame_parent "$cur")
+    indent="  $indent"
+  done
+}
+
+cmd_field() {
+  local rid; rid=$(root_frame)
+  echo "== open frames =="
+  while IFS=$'\t' read -r id type parent opened state; do
+    [[ "$state" == "open" ]] || continue
+    local w; w=$(compute_weight "$id")
+    printf "  %s [%s] W=%s\n" "$id" "$type" "$w"
+  done < "$FRAMES"
+  echo
+  echo "== paused frames =="
+  while IFS=$'\t' read -r id type parent opened state; do
+    [[ "$state" == "paused" ]] || continue
+    local w; w=$(compute_weight "$id")
+    printf "  %s [%s] W=%s\n" "$id" "$type" "$w"
+  done < "$FRAMES"
+  echo
+  if [[ -n "$rid" ]]; then
+    echo "== algedonic at root ($rid) =="
+    _find_edges "$rid" | grep -E "felt-strike-from-depth|received-algedonic" | tail -20 || echo "  (none)"
+  fi
+}
+
+cmd_sheet() {
+  cat <<EOF
+═══════════════════════════════════════════════════════════════════
+  AGENT-FRAMES — session $SK
+  $(human_now)   threshold e=$E
+═══════════════════════════════════════════════════════════════════
+
+CURRENT
+EOF
+  cmd_in | sed 's/^/  /'
+  echo
+  echo "STACK (current → root, live weights)"
+  cmd_stack | sed 's/^/  /'
+  echo
+  echo "FIELD"
+  cmd_field | sed 's/^/  /'
+  echo
+  echo "═══════════════════════════════════════════════════════════════════"
+  echo "moves: try · eval · strike · emerge · spawn · resolve · whelp · pause"
+}
+
+cmd_brief() {
+  local cur; cur=$(current_frame)
+  local rid; rid=$(root_frame)
+  [[ -z "$cur" ]] && { echo "no current frame" >&2; exit 1; }
+  # parse --prehends <comma-separated-list> where each item is target:kind
+  local prehends_list=""
+  if [[ "${1:-}" == "--prehends" ]]; then
+    prehends_list="${2:-}"
+    shift 2 || true
+  fi
+  cat <<EOF
+SUB-AGENT BRIEFING — agent-frames protocol v2
+
+You are operating inside:
+  FRAME_ID=$cur     ROOT_ID=$rid
+  AGENT_FRAMES_SESSION=$SK   (export this for any sub-process)
+
+Moves you have:
+  frame try   <action>          record an attempt
+  frame eval  success|strike|emergency [note]
+                                evaluate the prior try (REQUIRED before next try)
+  frame strike <cause>          shorthand: eval prior try as strike
+  frame emerge <cause>          algedonic emergency — fires to root immediately
+  frame spawn <type> <because>  open a sub-frame (warns if you are stressed)
+  frame resolve <outcome>       close as success
+  frame whelp <reason>          close as honest give-up
+  frame circle <about>          deliberate pre-Fix regulation (warns not fires)
+  frame prehend <target> as <kind> [note]
+                                declare causal lineage (existence-checked)
+  frame perish as <kind> [note] type the legacy this frame leaves
+  frame ancestry [frame-id]     walk prehensions transitively
+EOF
+  if [[ -n "$prehends_list" ]]; then
+    cat <<EOF
+
+REQUIRED PREHENSIONS (declare these BEFORE starting work):
+EOF
+    # split on comma
+    local IFS=','
+    for item in $prehends_list; do
+      local t k
+      t="${item%:*}"
+      k="${item##*:}"
+      echo "  frame prehend $t as $k"
+    done
+    cat <<EOF
+
+If you cannot find or read any of these targets, take a strike — do not
+proceed with unprehended assumptions. Use 'as question' for honestly
+declared missing dependencies.
+
+Your deliverable must cite which prehension grounds each claim.
+EOF
+  fi
+  cat <<EOF
+
+Weight mechanism (live):
+  W(you) = (1/e) * W(your-parent_now) + your-local-strikes
+  If W > e ≈ 2.718, the CLI fires algedonic-emergency automatically.
+  Your weight changes when your parent's changes — this is intentional.
+  A child of a stressed parent has less slack. Not a punishment, a reading.
+
+Check your state with:  frame in   (shows weight bar)
+                        frame sheet (full picture)
+EOF
+}
+
+# ────────────────────────────────────────────────────────────────
+# Whitehead moves: circle (pre-prehension), prehend (past data),
+# perish (future data). Added 2026-05-26 after the experiments dir
+# prototype loop. See ~/repos/agent-frames-experiments/findings-so-far-v2.md.
+# ────────────────────────────────────────────────────────────────
+
+CIRCLE_STRIKES="$STATE_DIR/$SK.circle-strikes.tsv"
+touch "$CIRCLE_STRIKES"
+
+cmd_circle() {
+  local about="$*"
+  [[ -z "$about" ]] && { echo "frame circle: need an about-what" >&2; exit 1; }
+  local parent; parent=$(current_frame)
+  [[ -z "$parent" ]] && { echo "no current frame; use 'frame root' first" >&2; exit 1; }
+  local bs; bs=$(slugify "$about")
+  local id="frame-circling-for-$bs-$(now)"
+  _write_edge "$id" "opened-as" "fuck-around" fluid
+  _write_edge "$id" "opened-because" "circling-for-$bs" fluid
+  _write_edge "$id" "child-of" "$parent" fluid
+  _write_edge "$id" "is-circle-for" "$bs" salt
+  _write_edge "$id" "circle-began-at" "$(now)" fluid
+  printf "%s\t%s\t%s\t%s\t%s\n" "$id" "fuck-around" "$parent" "$(now)" "open" >> "$FRAMES"
+  echo "$id" > "$CUR"
+  echo "circling: $id"
+  echo "  about: $about"
+  echo "  success criterion: arriving loose, not progress"
+  echo "  strikes here are practice swings — use 'frame circle-strike' for tangents"
+  echo "  close with: frame ready <next-step>  OR  frame circle-out <reason>"
+}
+
+_is_circle_frame() {
+  local id="$1"
+  _find_edges "$id" | grep -F "($id " | grep -q "is-circle-for"
+}
+
+cmd_circle_strike() {
+  local cause="$*"
+  [[ -z "$cause" ]] && { echo "frame circle-strike: need a cause" >&2; exit 1; }
+  local cur; cur=$(current_frame)
+  [[ -z "$cur" ]] && { echo "no current frame" >&2; exit 1; }
+  if ! _is_circle_frame "$cur"; then
+    echo "frame circle-strike: $cur is not a circle. use 'frame strike' instead." >&2
+    exit 1
+  fi
+  local cs; cs=$(slugify "$cause")
+  printf "%s\t%s\t%s\n" "$cur" "$(now)" "$cs" >> "$CIRCLE_STRIKES"
+  _write_edge "$cur" "circle-tangent" "$cs" fluid
+  local n; n=$(awk -F'\t' -v id="$cur" '$1==id {n++} END {print n+0}' "$CIRCLE_STRIKES")
+  echo "circle-tangent $n on $cur: $cs"
+  if [[ "$n" -ge 3 ]]; then
+    echo "  ⚠ $n tangents — circle saturating. consider 'frame ready' or 'frame circle-out'."
+    echo "  (warning, not fire. you stay in control.)"
+  fi
+}
+
+cmd_circle_status() {
+  local cur; cur=$(current_frame)
+  [[ -z "$cur" ]] && { echo "no current frame"; return; }
+  if ! _is_circle_frame "$cur"; then
+    echo "$cur is not a circle"
+    return
+  fi
+  # extract the object of the circle-began-at edge: (... --circle-began-at--> <epoch>)
+  local began; began=$(_find_edges "$cur" | grep -F "($cur " | grep "circle-began-at" | head -1 | sed -E 's/.*--circle-began-at--> ([0-9]+).*/\1/')
+  local age=""
+  if [[ -n "$began" ]]; then age=" (age $(( $(now) - began ))s)"; fi
+  local about; about=$(_find_edges "$cur" | grep -F "($cur " | grep "is-circle-for" | head -1 | sed 's/.*--> //; s/[) ].*//')
+  local n; n=$(awk -F'\t' -v id="$cur" '$1==id {n++} END {print n+0}' "$CIRCLE_STRIKES" 2>/dev/null)
+  echo "circle: $cur$age"
+  echo "  about: $about"
+  echo "  tangents: $n (no auto-fire; warns at 3)"
+  if [[ "$n" -gt 0 ]]; then
+    echo "  recent:"
+    awk -F'\t' -v id="$cur" '$1==id {print "    - " $3}' "$CIRCLE_STRIKES" | tail -5
+  fi
+}
+
+cmd_ready() {
+  local next="$*"
+  [[ -z "$next" ]] && { echo "frame ready: need a next-step" >&2; exit 1; }
+  local cur; cur=$(current_frame)
+  [[ -z "$cur" ]] && { echo "no current frame" >&2; exit 1; }
+  if ! _is_circle_frame "$cur"; then
+    echo "frame ready: $cur is not a circle. use 'frame resolve' instead." >&2
+    exit 1
+  fi
+  local ns; ns=$(slugify "$next")
+  _write_edge "$cur" "circle-arrived-ready-for" "$ns" salt
+  cmd_resolve "circle-ready-for-$ns"
+  echo "ready. next: $next"
+}
+
+cmd_circle_out() {
+  local reason="$*"
+  [[ -z "$reason" ]] && { echo "frame circle-out: need a reason" >&2; exit 1; }
+  local cur; cur=$(current_frame)
+  [[ -z "$cur" ]] && { echo "no current frame" >&2; exit 1; }
+  if ! _is_circle_frame "$cur"; then
+    echo "frame circle-out: $cur is not a circle." >&2
+    exit 1
+  fi
+  local rs; rs=$(slugify "$reason")
+  _write_edge "$cur" "circle-found-not-actually-a-fix" "$rs" salt
+  cmd_resolve "circle-out-$rs"
+  echo "circle-out: $reason"
+  echo "  the thing you thought was a Fix is something else — pivot upstairs"
+}
+
+cmd_prehend() {
+  local target="$1"; shift || true
+  local as_kw="$1"; shift || true
+  local kind="$1"; shift || true
+  local note="$*"
+  if [[ -z "$target" || "$as_kw" != "as" || -z "$kind" ]]; then
+    echo "frame prehend: usage: prehend <target> as <kind> [note]" >&2
+    echo "  kinds: evidence, method, counter, warning, seed, context, question" >&2
+    exit 1
+  fi
+  local cur; cur=$(current_frame)
+  [[ -z "$cur" ]] && { echo "no current frame" >&2; exit 1; }
+  # existence check — forces lookup-before-claim, closes fabrication vector
+  local exists="freeform-handle-unchecked"
+  if [[ "$target" =~ ^frame- ]]; then
+    if grep -q "^$target	" "$FRAMES" 2>/dev/null; then exists="frame-found"
+    else exists="frame-missing"; fi
+  elif [[ "$target" =~ ^# ]]; then
+    if _find_edges "$target" >/dev/null 2>&1; then exists="edge-found"
+    else exists="edge-missing"; fi
+  elif [[ "$target" =~ ^[~/.] ]]; then
+    local resolved="${target/#\~/$HOME}"
+    if [[ -e "$resolved" ]]; then exists="file-found"
+    else exists="file-missing"; fi
+  fi
+  # `as question` is the honest escape hatch for missing targets
+  if [[ "$exists" =~ missing && "$kind" != "question" ]]; then
+    echo "frame prehend: target does not exist: $target ($exists)" >&2
+    echo "  refusing — prehending a non-existent target is fabrication-prone" >&2
+    echo "  if you mean to declare an unmet dependency: prehend $target as question \"$note\"" >&2
+    exit 2
+  fi
+  local ns; ns=$(slugify "${note:-no-note}")
+  _write_edge "$cur" "prehends-as-$kind" "$target:$ns" fluid
+  echo "prehended: $target as $kind ($ns) [$exists]"
+}
+
+cmd_perish() {
+  local as_kw="$1"; shift || true
+  local kind="$1"; shift || true
+  local note="$*"
+  if [[ "$as_kw" != "as" || -z "$kind" ]]; then
+    echo "frame perish: usage: perish as <kind> [note]" >&2
+    echo "  kinds: evidence, method, warning, receipt, question, seed" >&2
+    echo "  (perish types the legacy; you still need to resolve/whelp to close the frame)" >&2
+    exit 1
+  fi
+  local cur; cur=$(current_frame)
+  [[ -z "$cur" ]] && { echo "no current frame" >&2; exit 1; }
+  local ns; ns=$(slugify "${note:-no-note}")
+  _write_edge "$cur" "perished-as-$kind" "$ns" salt
+  echo "perished: $cur as $kind ($ns)"
+  echo "  (call frame resolve/whelp next to close the frame)"
+}
+
+cmd_ancestry() {
+  local id="${1:-$(current_frame)}"
+  local max_depth="${2:-3}"
+  [[ -z "$id" ]] && { echo "frame ancestry: no frame" >&2; exit 1; }
+  echo "ancestry of $id (transitive, max depth $max_depth):"
+  _ancestry_walk "$id" "" "$max_depth"
+}
+_ancestry_walk() {
+  local id="$1" indent="$2" depth="$3"
+  [[ "$depth" -le 0 ]] && return
+  # subject-only filter — edge find is symmetric, walk directed
+  local lines
+  lines=$(_find_edges "$id" \
+    | grep -F "($id " \
+    | grep -oE "prehends-as-[a-z-]+--> [^ )]+" \
+    || true)
+  if [[ -z "$lines" ]]; then
+    [[ -z "$indent" ]] && echo "  (no prehensions)"
+    return
+  fi
+  while IFS= read -r line; do
+    [[ -z "$line" ]] && continue
+    local kind target
+    kind=$(echo "$line" | sed -E 's/prehends-as-([a-z-]+)-->.*/\1/')
+    target=$(echo "$line" | sed -E 's/.*--> //; s/:.*//')
+    echo "${indent}└─ as-$kind: $target"
+    if [[ "$target" =~ ^frame- ]]; then
+      _ancestry_walk "$target" "  $indent" "$((depth - 1))"
+    fi
+  done <<< "$lines"
+}
+
+# ────────────────────────────────────────────────────────────────
+# dispatch
+# ────────────────────────────────────────────────────────────────
+cmd="${1:-sheet}"; shift || true
+case "$cmd" in
+  root)     cmd_root "$@" ;;
+  open)     cmd_open "$@" ;;
+  spawn)    cmd_spawn "$@" ;;
+  try)       cmd_try "$@" ;;
+  eval)      cmd_eval "$@" ;;
+  strike)    cmd_strike "$@" ;;
+  emerge)    cmd_emerge "$@" ;;
+  intervene) cmd_intervene "$@" ;;
+  down)      cmd_down "$@" ;;
+  story)     cmd_story "$@" ;;
+  stories)   cmd_stories ;;
+  circle)        cmd_circle "$@" ;;
+  ready)         cmd_ready "$@" ;;
+  circle-out)    cmd_circle_out "$@" ;;
+  circle-strike) cmd_circle_strike "$@" ;;
+  circle-status) cmd_circle_status ;;
+  prehend)       cmd_prehend "$@" ;;
+  perish)        cmd_perish "$@" ;;
+  ancestry)      cmd_ancestry "$@" ;;
+  resolve)  cmd_resolve "$@" ;;
+  whelp)    cmd_whelp "$@" ;;
+  pause)    cmd_pause "$@" ;;
+  resume)   cmd_resume "$@" ;;
+  switch)   cmd_switch "$@" ;;
+  in)       cmd_in ;;
+  stack)    cmd_stack ;;
+  field)    cmd_field ;;
+  sheet)    cmd_sheet ;;
+  brief)    cmd_brief "$@" ;;
+  -h|--help|help)
+    sed -n '1,60p' "$0" | grep -E "^#" | sed 's/^# \{0,1\}//' ;;
+  *)
+    echo "unknown command: $cmd (try: frame help)" >&2; exit 1 ;;
+esac

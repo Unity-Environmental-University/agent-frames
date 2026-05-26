@@ -1,0 +1,10 @@
+# local state — never tracked
+.agent_frames/
+*.bak
+*.bak2
+
+# editor noise
+.DS_Store
+*~
+.vscode/
+.idea/
