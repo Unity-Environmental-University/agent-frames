@@ -1,0 +1,276 @@
+#!/usr/bin/env bash
+# frame-overlord — Zerg-mode swarm orchestration for agent-frames.
+#
+# Workers are independent `frame` sessions (each with its own
+# AGENT_FRAMES_SESSION) producing state at ~/.agent_frames/*.tsv.
+#
+# The overlord reads workers' state files and provides:
+#   - swarm-W aggregation (max of worker Ws by default)
+#   - swarm-level threshold and fire (configurable)
+#   - intervention dispatch (absorb a strike on a specific worker)
+#   - force-whelp (kill a saturated or stuck worker)
+#   - live field view
+#
+# Workers do not know about each other. The overlord is the only
+# coordinator. This honors agent-frames' substrate: subject-positions
+# remain isolated; orchestration is overlay, not entanglement.
+#
+# Usage:
+#   frame-overlord init <swarm-name>             # establish overlord identity
+#   frame-overlord spawn <worker-name> [cmd...]  # register worker (cmd optional)
+#   frame-overlord workers                        # list registered workers
+#   frame-overlord field                          # show all workers + their Ws
+#   frame-overlord swarm-w [--mode max|sum]       # compute swarm-level W
+#   frame-overlord intervene <worker> <kind> [note]
+#   frame-overlord kill <worker> <reason>         # force-whelp worker root
+#   frame-overlord watch [--interval Ns]          # live field, refresh every N seconds
+#   frame-overlord retire                         # close overlord; workers continue
+
+set -u
+
+STATE_DIR="${HOME}/.agent_frames"
+mkdir -p "$STATE_DIR"
+E="2.718281828459045"
+SWARM_THRESHOLD_MULT="${FRAME_SWARM_THRESHOLD_MULT:-1.5}"   # swarm fires at SWARM_THRESHOLD_MULT * e
+
+OVERLORD_NAME="${FRAME_OVERLORD:-default}"
+OVERLORD_DIR="$STATE_DIR/overlord-$OVERLORD_NAME"
+WORKERS_FILE="$OVERLORD_DIR/workers.tsv"
+
+mkdir -p "$OVERLORD_DIR"
+touch "$WORKERS_FILE"
+
+FRAME="$(cd "$(dirname "$0")" && pwd)/frame"
+[[ ! -x "$FRAME" ]] && FRAME="$(command -v frame || echo /usr/local/bin/frame)"
+
+# ────────────────────────────────────────────────────────────────
+# helpers
+# ────────────────────────────────────────────────────────────────
+
+now() { date +%s; }
+human() { date +%H:%M:%S; }
+
+# Compute weight for a worker session by reading its state files directly.
+# Mirrors frame's compute_weight algorithm.
+worker_w() {
+  local sk="$1"
+  local cur_file="$STATE_DIR/$sk.current"
+  [[ ! -f "$cur_file" ]] && { echo "0.0000"; return; }
+  local cur; cur=$(cat "$cur_file")
+  [[ -z "$cur" ]] && { echo "0.0000"; return; }
+  _w_recursive "$sk" "$cur"
+}
+
+_w_recursive() {
+  local sk="$1" id="$2"
+  local frames_file="$STATE_DIR/$sk.frames.tsv"
+  local strikes_file="$STATE_DIR/$sk.strikes.tsv"
+  local local_s; local_s=$(awk -F'\t' -v id="$id" '$1==id {n++} END {print n+0}' "$strikes_file" 2>/dev/null)
+  local parent; parent=$(awk -F'\t' -v id="$id" '$1==id {print $3; exit}' "$frames_file" 2>/dev/null)
+  if [[ "$parent" == "ROOT" || -z "$parent" ]]; then
+    awk "BEGIN {printf \"%.4f\", $local_s}"
+  else
+    local pw; pw=$(_w_recursive "$sk" "$parent")
+    awk -v ie="0.36787944117144233" "BEGIN {printf \"%.4f\", (ie * $pw) + $local_s}"
+  fi
+}
+
+worker_state() {
+  local sk="$1"
+  local frames_file="$STATE_DIR/$sk.frames.tsv"
+  [[ ! -f "$frames_file" || ! -s "$frames_file" ]] && { echo "uninit"; return; }
+  local cur_file="$STATE_DIR/$sk.current"
+  if [[ ! -f "$cur_file" || ! -s "$cur_file" ]]; then
+    echo "stack-empty"
+  else
+    echo "active"
+  fi
+}
+
+worker_strike_count() {
+  local sk="$1"
+  local strikes_file="$STATE_DIR/$sk.strikes.tsv"
+  wc -l < "$strikes_file" 2>/dev/null | tr -d ' ' || echo 0
+}
+
+list_workers() {
+  awk -F'\t' '{print $1}' "$WORKERS_FILE"
+}
+
+# ────────────────────────────────────────────────────────────────
+# commands
+# ────────────────────────────────────────────────────────────────
+
+cmd_init() {
+  local swarm="${1:-}"
+  [[ -z "$swarm" ]] && { echo "frame-overlord init: need a swarm name" >&2; exit 1; }
+  printf "%s\n" "$swarm" > "$OVERLORD_DIR/swarm-name"
+  printf "%s\n" "$(now)" > "$OVERLORD_DIR/born-at"
+  echo "overlord: $OVERLORD_NAME"
+  echo "swarm:    $swarm"
+  echo "state:    $OVERLORD_DIR"
+  echo "threshold: $(awk -v m="$SWARM_THRESHOLD_MULT" -v e="$E" 'BEGIN {printf "%.4f", m * e}') (= $SWARM_THRESHOLD_MULT × e)"
+}
+
+cmd_spawn() {
+  local name="${1:-}"; shift || true
+  [[ -z "$name" ]] && { echo "frame-overlord spawn: need a worker name" >&2; exit 1; }
+  local sk="worker-$OVERLORD_NAME-$name"
+  if grep -q "^$name	" "$WORKERS_FILE"; then
+    echo "worker $name already registered (session $sk)"
+    return
+  fi
+  printf "%s\t%s\t%s\n" "$name" "$sk" "$(now)" >> "$WORKERS_FILE"
+  echo "registered worker: $name"
+  echo "  session key: $sk"
+  echo "  export this and use 'frame' as normal:"
+  echo "    export AGENT_FRAMES_SESSION=$sk"
+  echo "    frame root fix \"...\""
+  if [[ "$#" -gt 0 ]]; then
+    echo "  (cmd: $*)"
+    echo "  to run that cmd in the worker's session, invoke it yourself with the env set"
+  fi
+}
+
+cmd_workers() {
+  if [[ ! -s "$WORKERS_FILE" ]]; then
+    echo "no workers registered. use: frame-overlord spawn <name>"
+    return
+  fi
+  printf "%-20s %-40s %s\n" "NAME" "SESSION" "REGISTERED"
+  while IFS=$'\t' read -r name sk born; do
+    printf "%-20s %-40s %s\n" "$name" "$sk" "$(date -r "$born" "+%H:%M:%S")"
+  done < "$WORKERS_FILE"
+}
+
+cmd_field() {
+  if [[ ! -s "$WORKERS_FILE" ]]; then
+    echo "no workers."
+    return
+  fi
+  printf "%-20s %-12s %-8s %-8s %s\n" "WORKER" "STATE" "STRIKES" "W" "BAR"
+  while IFS=$'\t' read -r name sk born; do
+    local state; state=$(worker_state "$sk")
+    local strikes; strikes=$(worker_strike_count "$sk")
+    local w; w=$(worker_w "$sk")
+    local frac
+    frac=$(awk -v v="$w" -v m="$E" 'BEGIN {f=v/m; if(f>1)f=1; if(f<0)f=0; print f}')
+    local filled; filled=$(awk -v f="$frac" 'BEGIN {printf "%d", int(f*10+0.5)}')
+    local empty=$((10 - filled))
+    local bar=""
+    for ((i=0; i<filled; i++)); do bar+="▰"; done
+    for ((i=0; i<empty;  i++)); do bar+="▱"; done
+    printf "%-20s %-12s %-8s %-8s %s\n" "$name" "$state" "$strikes" "$w" "$bar"
+  done < "$WORKERS_FILE"
+}
+
+cmd_swarm_w() {
+  local mode="max"
+  if [[ "${1:-}" == "--mode" ]]; then mode="$2"; fi
+  if [[ ! -s "$WORKERS_FILE" ]]; then echo "0.0000"; return; fi
+  case "$mode" in
+    max)
+      local maxw="0.0000"
+      while IFS=$'\t' read -r name sk born; do
+        local w; w=$(worker_w "$sk")
+        if awk -v a="$w" -v b="$maxw" 'BEGIN {exit !(a > b)}'; then maxw="$w"; fi
+      done < "$WORKERS_FILE"
+      echo "$maxw"
+      ;;
+    sum)
+      local sum="0.0000"
+      while IFS=$'\t' read -r name sk born; do
+        local w; w=$(worker_w "$sk")
+        sum=$(awk -v s="$sum" -v w="$w" 'BEGIN {printf "%.4f", s + w}')
+      done < "$WORKERS_FILE"
+      echo "$sum"
+      ;;
+    *)
+      echo "frame-overlord swarm-w: unknown mode: $mode (max|sum)" >&2
+      exit 1
+      ;;
+  esac
+}
+
+cmd_intervene() {
+  local worker="${1:-}"; local kind="${2:-peer}"; shift 2 || true
+  local note="$*"
+  [[ -z "$worker" ]] && { echo "frame-overlord intervene: need worker name" >&2; exit 1; }
+  local sk; sk=$(awk -F'\t' -v n="$worker" '$1==n {print $2; exit}' "$WORKERS_FILE")
+  [[ -z "$sk" ]] && { echo "unknown worker: $worker" >&2; exit 1; }
+  echo "dispatching intervene → $worker (kind: $kind)"
+  AGENT_FRAMES_SESSION="$sk" "$FRAME" intervene "$kind" "overlord:${note:-grace}"
+}
+
+cmd_kill() {
+  local worker="${1:-}"; shift || true
+  local reason="$*"
+  [[ -z "$worker" ]] && { echo "frame-overlord kill: need worker name" >&2; exit 1; }
+  [[ -z "$reason" ]] && { echo "frame-overlord kill: need a reason (be honest)" >&2; exit 1; }
+  local sk; sk=$(awk -F'\t' -v n="$worker" '$1==n {print $2; exit}' "$WORKERS_FILE")
+  [[ -z "$sk" ]] && { echo "unknown worker: $worker" >&2; exit 1; }
+  echo "force-whelping worker $worker: $reason"
+  # whelp all open frames in the worker's session until stack is empty
+  local guard=0
+  while [[ -f "$STATE_DIR/$sk.current" && -s "$STATE_DIR/$sk.current" && "$guard" -lt 20 ]]; do
+    AGENT_FRAMES_SESSION="$sk" "$FRAME" whelp "overlord-killed:$reason" 2>&1 | tail -1
+    guard=$((guard + 1))
+  done
+  echo "worker $worker stack: empty"
+}
+
+cmd_watch() {
+  local interval=2
+  if [[ "${1:-}" == "--interval" ]]; then interval="${2}"; fi
+  local threshold; threshold=$(awk -v m="$SWARM_THRESHOLD_MULT" -v e="$E" 'BEGIN {printf "%.4f", m * e}')
+  while true; do
+    clear 2>/dev/null || printf "\n\n\n"
+    echo "═══════════════════════════════════════════════════════════════"
+    echo "  overlord: $OVERLORD_NAME    swarm: $(cat "$OVERLORD_DIR/swarm-name" 2>/dev/null || echo "?")"
+    echo "  $(human)   threshold: $threshold   refresh: ${interval}s   ctrl-c to stop"
+    echo "═══════════════════════════════════════════════════════════════"
+    echo
+    cmd_field
+    echo
+    local sw; sw=$(cmd_swarm_w)
+    local warn=""
+    if awk -v a="$sw" -v t="$threshold" 'BEGIN {exit !(a > t)}'; then
+      warn=" 🚨 SWARM OVER THRESHOLD"
+    elif awk -v a="$sw" -v t="$threshold" 'BEGIN {exit !(a > t * 0.75)}'; then
+      warn=" ⚠ swarm approaching threshold"
+    fi
+    echo "  swarm-W (max): $sw / $threshold$warn"
+    sleep "$interval"
+  done
+}
+
+cmd_retire() {
+  local archive="$OVERLORD_DIR/retired-$(now)"
+  mv "$WORKERS_FILE" "$archive" 2>/dev/null || true
+  touch "$WORKERS_FILE"
+  echo "overlord $OVERLORD_NAME retired. workers continue independently."
+  echo "  workers archive: $archive"
+}
+
+# ────────────────────────────────────────────────────────────────
+# dispatch
+# ────────────────────────────────────────────────────────────────
+cmd="${1:-field}"; shift || true
+case "$cmd" in
+  init)       cmd_init "$@" ;;
+  spawn)      cmd_spawn "$@" ;;
+  workers)    cmd_workers ;;
+  field)      cmd_field ;;
+  swarm-w)    cmd_swarm_w "$@" ;;
+  intervene)  cmd_intervene "$@" ;;
+  kill)       cmd_kill "$@" ;;
+  watch)      cmd_watch "$@" ;;
+  retire)     cmd_retire ;;
+  -h|--help|help)
+    sed -n '1,30p' "$0" | grep -E "^#" | sed 's/^# \{0,1\}//'
+    ;;
+  *)
+    echo "unknown command: $cmd (try: frame-overlord help)" >&2
+    exit 1
+    ;;
+esac

@@ -49,6 +49,7 @@ See [INSTALL.md](INSTALL.md) for more options.
 - [CONCEPTS.md](CONCEPTS.md) — the mechanism: frames, moves, weight math, kinds vocabulary, when to use, when not to
 - [examples/01-first-frame.md](examples/01-first-frame.md) — a fuller worked example
 - [examples/00-demo.bash](examples/00-demo.bash) — the runnable demo
+- [examples/02-zerg-mode.md](examples/02-zerg-mode.md) + [examples/02-zerg-demo.bash](examples/02-zerg-demo.bash) — overlord-coordinated swarms of workers
 
 ## When to use it
 

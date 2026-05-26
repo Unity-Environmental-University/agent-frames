@@ -1,5 +1,6 @@
 # local state — never tracked
 .agent_frames/
+.edge/
 *.bak
 *.bak2
 
