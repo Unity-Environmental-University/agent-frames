@@ -36,9 +36,13 @@ SWARM_THRESHOLD_MULT="${FRAME_SWARM_THRESHOLD_MULT:-1.5}"   # swarm fires at SWA
 OVERLORD_NAME="${FRAME_OVERLORD:-default}"
 OVERLORD_DIR="$STATE_DIR/overlord-$OVERLORD_NAME"
 WORKERS_FILE="$OVERLORD_DIR/workers.tsv"
+# supervised.tsv: lines of "kind\tid" where kind is ling|drone|overlord
+# this is the algedonic supervision graph — overlords supervising anything,
+# including other overlords, recursively.
+SUPERVISED_FILE="$OVERLORD_DIR/supervised.tsv"
 
 mkdir -p "$OVERLORD_DIR"
-touch "$WORKERS_FILE"
+touch "$WORKERS_FILE" "$SUPERVISED_FILE"
 
 FRAME="$(cd "$(dirname "$0")" && pwd)/frame"
 [[ ! -x "$FRAME" ]] && FRAME="$(command -v frame || echo /usr/local/bin/frame)"
@@ -244,6 +248,131 @@ cmd_watch() {
   done
 }
 
+cmd_supervise() {
+  local kind="${1:-}"; local id="${2:-}"
+  [[ -z "$kind" || -z "$id" ]] && { echo "frame-overlord supervise: need <kind> <id>" >&2
+    echo "  kinds: ling | drone | overlord" >&2
+    exit 1; }
+  if grep -q "^$kind	$id$" "$SUPERVISED_FILE"; then
+    echo "$kind $id already supervised by $OVERLORD_NAME"
+    return
+  fi
+  printf "%s\t%s\n" "$kind" "$id" >> "$SUPERVISED_FILE"
+  echo "now supervising: $kind $id"
+}
+
+# Aggregate W across this overlord's supervised units.
+# For lings/drones: read their frame W via frame's compute path.
+# For sub-overlords: recurse.
+# Default aggregation: max (any one in trouble → overlord feels it)
+# Set FRAME_OVERLORD_AGG=mean for averaged.
+cmd_overlord_w() {
+  if [[ ! -s "$SUPERVISED_FILE" ]]; then
+    echo "0.0000"
+    return
+  fi
+  local agg="${FRAME_OVERLORD_AGG:-max}"
+  local accum="0.0000" count=0
+  while IFS=$'\t' read -r kind id; do
+    local w="0.0000"
+    case "$kind" in
+      ling|drone)
+        # ling/drone id is a frame-id. Look up its session and compute.
+        # Convention: frame ids contain a session-derivable prefix? Not in general.
+        # Simpler: assume the supervised frame is in OUR session for v1.
+        w=$(_w_recursive_for_frame "$id")
+        ;;
+      overlord)
+        # recurse: spawn a frame-overlord call on the sub-overlord
+        w=$(FRAME_OVERLORD="$id" "$0" overlord-w 2>/dev/null || echo "0.0000")
+        ;;
+    esac
+    count=$((count + 1))
+    if [[ "$agg" == "max" ]]; then
+      if awk -v a="$w" -v b="$accum" 'BEGIN {exit !(a > b)}'; then accum="$w"; fi
+    elif [[ "$agg" == "mean" ]]; then
+      accum=$(awk -v a="$accum" -v w="$w" 'BEGIN {printf "%.4f", a + w}')
+    fi
+  done < "$SUPERVISED_FILE"
+  if [[ "$agg" == "mean" && "$count" -gt 0 ]]; then
+    accum=$(awk -v a="$accum" -v c="$count" 'BEGIN {printf "%.4f", a / c}')
+  fi
+  echo "$accum"
+}
+
+# Compute frame weight given just the frame-id (any session).
+# Searches across all session frames.tsv to find the frame's data.
+_w_recursive_for_frame() {
+  local id="$1"
+  # find which session this frame belongs to
+  local frames_file
+  for f in "$STATE_DIR"/*.frames.tsv; do
+    [[ -e "$f" ]] || continue
+    if grep -q "^$id	" "$f" 2>/dev/null; then
+      frames_file="$f"
+      break
+    fi
+  done
+  [[ -z "${frames_file:-}" ]] && { echo "0.0000"; return; }
+  local sk; sk=$(basename "$frames_file" .frames.tsv)
+  _w_recursive "$sk" "$id"
+}
+
+# When the overlord itself crosses threshold, force-whelp all supervised lings
+# AND emit a warning to its own supervisor (if any).
+cmd_overlord_fire() {
+  local reason="${*:-overlord-w-exceeded-e}"
+  local ow; ow=$(cmd_overlord_w)
+  echo "🚨 OVERLORD FIRE: $OVERLORD_NAME at W=$ow — $reason"
+  echo "force-whelping all supervised lings..."
+  while IFS=$'\t' read -r kind id; do
+    case "$kind" in
+      ling|drone)
+        # find session, force-whelp
+        local frames_file
+        for f in "$STATE_DIR"/*.frames.tsv; do
+          [[ -e "$f" ]] || continue
+          if grep -q "^$id	" "$f" 2>/dev/null; then frames_file="$f"; break; fi
+        done
+        if [[ -n "${frames_file:-}" ]]; then
+          local sk; sk=$(basename "$frames_file" .frames.tsv)
+          AGENT_FRAMES_SESSION="$sk" "$FRAME" whelp "overlord-fired:$reason" 2>&1 | tail -1
+        fi
+        ;;
+      overlord)
+        echo "  cascading to sub-overlord: $id"
+        FRAME_OVERLORD="$id" "$0" overlord-fire "cascaded-from-$OVERLORD_NAME" 2>&1 | sed 's/^/  /'
+        ;;
+    esac
+  done < "$SUPERVISED_FILE"
+  # if we have a parent overlord, leave a salt-warning for it
+  local parent_overlord="${FRAME_OVERLORD_PARENT:-}"
+  if [[ -n "$parent_overlord" ]]; then
+    echo "notifying parent overlord: $parent_overlord"
+    echo "(parent will see this overlord's fire via its own supervised list aggregation)"
+  fi
+  echo "overlord-fire complete."
+}
+
+cmd_supervised() {
+  echo "supervised by $OVERLORD_NAME:"
+  if [[ ! -s "$SUPERVISED_FILE" ]]; then
+    echo "  (nothing)"
+    return
+  fi
+  while IFS=$'\t' read -r kind id; do
+    local w
+    if [[ "$kind" == "overlord" ]]; then
+      w=$(FRAME_OVERLORD="$id" "$0" overlord-w 2>/dev/null || echo "?")
+    else
+      w=$(_w_recursive_for_frame "$id")
+    fi
+    printf "  %-10s %-50s W=%s\n" "$kind" "$id" "$w"
+  done < "$SUPERVISED_FILE"
+  echo
+  echo "aggregate overlord-W: $(cmd_overlord_w)"
+}
+
 cmd_retire() {
   local archive="$OVERLORD_DIR/retired-$(now)"
   mv "$WORKERS_FILE" "$archive" 2>/dev/null || true
@@ -265,7 +394,11 @@ case "$cmd" in
   intervene)  cmd_intervene "$@" ;;
   kill)       cmd_kill "$@" ;;
   watch)      cmd_watch "$@" ;;
-  retire)     cmd_retire ;;
+  retire)        cmd_retire ;;
+  supervise)     cmd_supervise "$@" ;;
+  supervised)    cmd_supervised ;;
+  overlord-w)    cmd_overlord_w ;;
+  overlord-fire) cmd_overlord_fire "$@" ;;
   -h|--help|help)
     sed -n '1,30p' "$0" | grep -E "^#" | sed 's/^# \{0,1\}//'
     ;;

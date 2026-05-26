@@ -1,0 +1,237 @@
+#!/usr/bin/env bash
+# frame-economy — mineral ledger + ling spawn for agent-frames.
+#
+# Drones earn minerals doing chores (hardening, docs, DRY, legibility).
+# Lings spend minerals to build features.
+# The hatchery (the user-with-Claude) cannot spawn a ling whose cost exceeds
+# current minerals — the system is self-honest about its sustainability.
+#
+# This sits on top of `frame`. Every ling is still a frame; the FAFO loop
+# (try/eval/strike, fire-at-e, circle) governs every spawn. The economy
+# constrains what can be ATTEMPTED. The algedonic channel decides what
+# actually happens.
+#
+# Pathetic governance property: the economy never overrides the algedonic
+# channel. A ling that fires deposits NOTHING. A ling that whelps deposits
+# NOTHING. Only honest completions touch the ledger.
+#
+# Usage:
+#   frame-economy minerals                      show balance + recent activity
+#   frame-economy spawn <ling-type> <task>      check cost, spawn if affordable
+#   frame-economy deposit <amount> <source> <note>
+#                                                drone deposits earned minerals
+#   frame-economy spend <amount> <ling> <note>  ling spends (internal)
+#   frame-economy ledger                         dump full ledger
+#   frame-economy ling-types                     list available lings
+#   frame-economy warnings                       show salt-warnings from fired lings
+
+set -u
+
+STATE_DIR="${HOME}/.agent_frames"
+ROOT_DIR="$(cd "$(dirname "$0")/.." && pwd)"
+LINGS_DIR="$ROOT_DIR/lings"
+FRAME="$ROOT_DIR/bin/frame"
+
+session_key() {
+  if [[ -n "${AGENT_FRAMES_SESSION:-}" ]]; then echo "$AGENT_FRAMES_SESSION"
+  else pwd | shasum | cut -c1-12
+  fi
+}
+SK=$(session_key)
+LEDGER="$STATE_DIR/$SK.minerals.tsv"
+WARNINGS="$STATE_DIR/$SK.spawn-warnings.tsv"
+touch "$LEDGER" "$WARNINGS"
+
+now() { date +%s; }
+
+# Cumulative balance from the ledger.
+balance() {
+  awk -F'\t' '{s+=$3} END {print s+0}' "$LEDGER"
+}
+
+# Ling registry — type:cost. Could be loaded from $LINGS_DIR/*.md frontmatter
+# later, but for v0.1 we hardcode the costs alongside the briefs.
+ling_cost() {
+  case "$1" in
+    drone)     echo 0  ;;   # drones earn, don't spend (they only DEPOSIT)
+    zergling)  echo 3  ;;   # small feature
+    hydralisk) echo 5  ;;   # test work, slightly pricier (judgment-heavy)
+    mutalisk)  echo 7  ;;   # cross-file pattern work, expensive
+    hatchery)  echo 10 ;;   # new infrastructure
+    *)         echo -1 ;;   # unknown
+  esac
+}
+
+# ────────────────────────────────────────────────────────────────
+# commands
+# ────────────────────────────────────────────────────────────────
+
+cmd_minerals() {
+  local bal; bal=$(balance)
+  echo "minerals: $bal"
+  echo
+  echo "recent activity (last 10):"
+  if [[ ! -s "$LEDGER" ]]; then
+    echo "  (none)"
+    return
+  fi
+  printf "  %-19s %-10s %6s  %s\n" "WHEN" "TYPE" "DELTA" "NOTE"
+  tail -10 "$LEDGER" | while IFS=$'\t' read -r ts type delta source note; do
+    local when; when=$(date -r "$ts" "+%m-%d %H:%M:%S")
+    local sign=""
+    [[ "$delta" -gt 0 ]] && sign="+"
+    printf "  %-19s %-10s %s%5d  %s (from %s)\n" "$when" "$type" "$sign" "$delta" "$note" "$source"
+  done
+}
+
+cmd_ledger() {
+  cat "$LEDGER"
+}
+
+cmd_ling_types() {
+  printf "%-12s %s\n" "TYPE" "COST"
+  for t in drone zergling hydralisk mutalisk hatchery; do
+    printf "%-12s %d\n" "$t" "$(ling_cost "$t")"
+  done
+}
+
+cmd_warnings() {
+  echo "spawn warnings (deposited by fired lings):"
+  if [[ ! -s "$WARNINGS" ]]; then
+    echo "  (none yet — no lings have fired)"
+    return
+  fi
+  printf "  %-19s %-10s  %s\n" "WHEN" "LING" "WARNING"
+  tail -20 "$WARNINGS" | while IFS=$'\t' read -r ts ling note; do
+    local when; when=$(date -r "$ts" "+%m-%d %H:%M:%S")
+    printf "  %-19s %-10s  %s\n" "$when" "$ling" "$note"
+  done
+}
+
+cmd_deposit() {
+  local amount="${1:-}"; local source="${2:-}"; shift 2 || true
+  local note="$*"
+  [[ -z "$amount" || -z "$source" ]] && { echo "frame-economy deposit: need <amount> <source> <note>" >&2; exit 1; }
+  [[ "$amount" -le 0 ]] && { echo "deposit must be positive" >&2; exit 1; }
+  printf "%s\t%s\t%s\t%s\t%s\n" "$(now)" "deposit" "$amount" "$source" "${note:-no-note}" >> "$LEDGER"
+  local bal; bal=$(balance)
+  echo "+$amount minerals deposited (source: $source). balance: $bal"
+}
+
+cmd_spend() {
+  local amount="${1:-}"; local ling="${2:-}"; shift 2 || true
+  local note="$*"
+  [[ -z "$amount" || -z "$ling" ]] && { echo "frame-economy spend: need <amount> <ling> <note>" >&2; exit 1; }
+  printf "%s\t%s\t%s\t%s\t%s\n" "$(now)" "spend" "-$amount" "$ling" "${note:-no-note}" >> "$LEDGER"
+  local bal; bal=$(balance)
+  echo "-$amount minerals spent (ling: $ling). balance: $bal"
+}
+
+cmd_spawn() {
+  local type="${1:-}"; shift || true
+  local task="$*"
+  [[ -z "$type" || -z "$task" ]] && { echo "frame-economy spawn: need <ling-type> <task>" >&2; exit 1; }
+  local cost; cost=$(ling_cost "$type")
+  if [[ "$cost" -lt 0 ]]; then
+    echo "frame-economy spawn: unknown ling type: $type" >&2
+    echo "  available: drone zergling hydralisk mutalisk hatchery" >&2
+    exit 1
+  fi
+
+  # affordability check — pathetic governance applies here
+  local bal; bal=$(balance)
+  if [[ "$cost" -gt "$bal" ]]; then
+    echo "🚫 cannot spawn $type: cost $cost > balance $bal"
+    echo "   the system is honest: you need $((cost - bal)) more mineral(s) first."
+    echo "   send a drone to do chores. try: frame-economy spawn drone <chore-task>"
+    exit 2
+  fi
+
+  # check for any salt-warnings about this ling type
+  if grep -q "^[0-9]*	$type	" "$WARNINGS" 2>/dev/null; then
+    local last_warn; last_warn=$(grep "^[0-9]*	$type	" "$WARNINGS" | tail -1 | cut -f3)
+    echo "⚠ prior $type ling fired with warning: $last_warn"
+    echo "  proceeding anyway — the warning is institutional memory, not a block"
+  fi
+
+  # open the frame as a sub-frame of the current frame
+  local cur; cur=$(cat "$STATE_DIR/$SK.current" 2>/dev/null || echo "")
+  if [[ -z "$cur" ]]; then
+    echo "frame-economy spawn: no current frame. open a hatchery frame first:"
+    echo "  frame root fix \"my-hatchery\""
+    exit 1
+  fi
+
+  # the ling is opened as a `fix` frame (subject to all FAFO mechanics)
+  # tagged with its ling type via a salt edge
+  "$FRAME" spawn fix "$type-ling-$task" >/dev/null
+  local ling_id; ling_id=$(cat "$STATE_DIR/$SK.current")
+
+  # spend the minerals (drones with cost=0 don't actually charge)
+  if [[ "$cost" -gt 0 ]]; then
+    cmd_spend "$cost" "$ling_id" "spawned-as-$type-for-$task" >/dev/null
+  fi
+
+  # tag the frame as this ling type
+  echo "🐛 spawned $type: $ling_id"
+  echo "   task: $task"
+  echo "   cost: $cost minerals (balance now: $(balance))"
+  echo
+  echo "📜 brief (paste into sub-agent prompt):"
+  echo "═══════════════════════════════════════════════════════════════"
+  if [[ -f "$LINGS_DIR/$type.md" ]]; then
+    cat "$LINGS_DIR/$type.md"
+  else
+    echo "(no brief file at $LINGS_DIR/$type.md — please create one)"
+  fi
+  echo "═══════════════════════════════════════════════════════════════"
+  echo
+  echo "ling frame id: $ling_id"
+  echo "ling cost:     $cost"
+  echo "ling task:     $task"
+  echo
+  echo "when the ling finishes honestly, it should:"
+  if [[ "$type" == "drone" ]]; then
+    echo "  frame perish as evidence \"<what-was-improved>\""
+    echo "  frame-economy deposit 1 $ling_id \"<chore-description>\""
+    echo "  frame resolve \"<short-outcome>\""
+  else
+    echo "  frame perish as evidence \"<what-was-built>\""
+    echo "  frame resolve \"<short-outcome>\""
+    echo "  (no deposit — features cost, they don't earn. drones earn the surplus.)"
+  fi
+  echo
+  echo "if the ling fires (W>e) or whelps, it deposits NOTHING and a salt-warning"
+  echo "is recorded. failed work does not pay."
+}
+
+# Internal: record a fired-ling warning (called by lings that whelp or fire)
+cmd_warn() {
+  local type="${1:-}"; local ling_id="${2:-}"; shift 2 || true
+  local note="$*"
+  [[ -z "$type" || -z "$ling_id" ]] && { echo "frame-economy warn: need <type> <ling-id> <note>" >&2; exit 1; }
+  printf "%s\t%s\t%s\t%s\n" "$(now)" "$type" "${note:-fired}" "$ling_id" >> "$WARNINGS"
+  echo "recorded warning for $type lings: $note"
+}
+
+# ────────────────────────────────────────────────────────────────
+# dispatch
+# ────────────────────────────────────────────────────────────────
+cmd="${1:-minerals}"; shift || true
+case "$cmd" in
+  minerals)    cmd_minerals ;;
+  spawn)       cmd_spawn "$@" ;;
+  deposit)     cmd_deposit "$@" ;;
+  spend)       cmd_spend "$@" ;;
+  ledger)      cmd_ledger ;;
+  ling-types)  cmd_ling_types ;;
+  warnings)    cmd_warnings ;;
+  warn)        cmd_warn "$@" ;;
+  -h|--help|help)
+    sed -n '1,30p' "$0" | grep -E "^#" | sed 's/^# \{0,1\}//'
+    ;;
+  *)
+    echo "unknown command: $cmd (try: frame-economy help)" >&2
+    exit 1
+    ;;
+esac
