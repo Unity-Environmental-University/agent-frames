@@ -52,6 +52,16 @@
 #   frame field                               all open/paused + root pain
 #   frame sheet                               full status sheet (canonical instrument)
 #   frame brief                               sub-agent briefing text
+#   frame circle   <phase> <about>            open a pre-prehension holding circle
+#   frame ready    [note]                     mark circle as ready to commit
+#   frame circle-out <result>                 close circle cleanly (result landed)
+#   frame circle-strike <cause>              take a strike inside the circle
+#   frame circle-status                      show active circle info
+#   frame prehend  <kind> <source> [note]    absorb a past result as causal input
+#                                              kinds: evidence method counter warning seed context question receipt
+#   frame perish   as <kind> <legacy>        record what this frame deposits into the future
+#   frame ancestry [id] [depth]              show prehension chain (causal lineage)
+#   frame swarm-memory                       list all whelped frames offering learning to the swarm
 
 set -euo pipefail
 
@@ -502,12 +512,12 @@ cmd_whelp() {
   local rid; rid=$(root_frame)
   local w; w=$(compute_weight "$cur")
   local rs; rs=$(slugify "$reason")
+  # self-edges: record the death
   _write_edge "$cur" "whelped-because" "$rs" salt
   _write_edge "$cur" "whelped-at-weight" "$w" salt
   set_state "$cur" "whelped"
   local parent; parent=$(frame_parent "$cur")
   if [[ "$parent" != "ROOT" && -n "$parent" ]]; then
-    # parent feels 1/e of child's weight as a strike-equivalent
     local up; up=$(awk "BEGIN {printf \"%.4f\", $ONE_OVER_E * $w}")
     printf "%s\t%s\t%s\n" "$parent" "$(now)" "child-$cur-whelped-fractional-$up" >> "$STRIKES"
     _write_edge "$parent" "took-strike-from" "child-$cur-whelped-W=$w-passed-up=$up" fluid
@@ -515,12 +525,18 @@ cmd_whelp() {
   if [[ -n "$rid" && "$rid" != "$cur" ]]; then
     _write_edge "$rid" "felt-strike-from-depth" "$cur:whelped:W=$w:$rs" fluid
   fi
+  # rhizomatic swarm memory: the dead frame deposits outward edges the swarm can traverse
+  # no owner — any future ling can prehend this frame as warning/question/seed
+  _write_edge "$cur" "offers-to-swarm" "whelped-because-$rs:W=$w" salt
+  _write_edge "$cur" "prehendable-as" "warning" salt
   if [[ "$parent" == "ROOT" || -z "$parent" ]]; then
     rm -f "$CUR"
-    echo "whelped root $cur ($rs, W=$w). stack empty."
+    echo "whelped $cur ($rs, W=$w). stack empty."
+    echo "  swarm memory: prehend $cur as warning"
   else
     echo "$parent" > "$CUR"
-    echo "whelped $cur ($rs, W=$w) → $parent (received $(awk "BEGIN{printf \"%.4f\",$ONE_OVER_E*$w}") strike-equiv)"
+    echo "whelped $cur ($rs, W=$w) → returned to swarm"
+    echo "  swarm memory: prehend $cur as warning"
     maybe_fire "$parent"
   fi
 }
@@ -673,7 +689,7 @@ Moves you have:
   frame spawn <type> <because>  open a sub-frame (warns if you are stressed)
   frame resolve <outcome>       close as success
   frame whelp <reason>          close as honest give-up
-  frame circle <about>          deliberate pre-Fix regulation (warns not fires)
+  frame circle <phase> <about>  deliberate pre-Fix regulation (warns not fires)
   frame prehend <target> as <kind> [note]
                                 declare causal lineage (existence-checked)
   frame perish as <kind> [note] type the legacy this frame leaves
@@ -909,6 +925,20 @@ _ancestry_walk() {
   done <<< "$lines"
 }
 
+cmd_swarm_memory() {
+  echo "== swarm memory (whelped frames offering learning) =="
+  local found=0
+  while IFS=$'\t' read -r ts subj pred obj phase; do
+    [[ "$pred" == "offers-to-swarm" ]] || continue
+    found=1
+    local reason; reason=$(echo "$obj" | sed 's/whelped-because-//; s/:W=.*$//')
+    local w; w=$(echo "$obj" | sed -E 's/.*:W=([0-9.]+).*/\1/')
+    printf "  %s\n    whelped: %s  W=%s\n    to prehend: frame prehend %s as warning\n\n" \
+      "$subj" "$reason" "$w" "$subj"
+  done < "$EDGES"
+  [[ "$found" -eq 0 ]] && echo "  (none — swarm has no whelp memory yet)"
+}
+
 # ────────────────────────────────────────────────────────────────
 # dispatch
 # ────────────────────────────────────────────────────────────────
@@ -933,6 +963,7 @@ case "$cmd" in
   prehend)       cmd_prehend "$@" ;;
   perish)        cmd_perish "$@" ;;
   ancestry)      cmd_ancestry "$@" ;;
+  swarm-memory)  cmd_swarm_memory ;;
   resolve)  cmd_resolve "$@" ;;
   whelp)    cmd_whelp "$@" ;;
   pause)    cmd_pause "$@" ;;
