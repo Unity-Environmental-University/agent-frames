@@ -59,6 +59,13 @@
 #   frame circle-status                      show active circle info
 #   frame prehend  <kind> <source> [note]    absorb a past result as causal input
 #                                              kinds: evidence method counter warning seed context question receipt
+#   frame hamartia [--locus approach|aim] <flaw>
+#                                              after descending into a FIRED frame: name the
+#                                              tragic flaw (how the loosed aim missed); this
+#                                              completes the perishing and offers it to the swarm.
+#                                              --locus (optional) names what broke: 'approach'
+#                                              (draw missed, story sound) or 'aim' (the user
+#                                              story itself needs revising). Omit if unknown.
 #   frame perish   as <kind> <legacy>        record what this frame deposits into the future
 #   frame ancestry [id] [depth]              show prehension chain (causal lineage)
 #   frame swarm-memory                       list all whelped frames offering learning to the swarm
@@ -120,6 +127,15 @@ _find_edges() {
 
 slugify() {
   echo "$1" | tr '[:upper:]' '[:lower:]' | tr -c 'a-z0-9' '-' | sed 's/--*/-/g; s/^-//; s/-$//' | cut -c1-50
+}
+
+# Full-text edge object: keep prose legible (case, punctuation, length) but
+# make it TSV-safe by collapsing the only two bytes that break the format —
+# tab and newline — into spaces. Use for edges a human must READ later (a
+# hamartia, a post-mortem), not slugs meant for matching. Truncating a lesson
+# is the same sin as suppressing one: the reader is left with less than was known.
+sanitize_text() {
+  printf '%s' "$1" | tr '\t\n' '  '
 }
 now() { date +%s; }
 human_now() { date "+%Y-%m-%d %H:%M:%S"; }
@@ -248,20 +264,24 @@ maybe_fire() {
   root_id=$(root_frame)
   echo "⚠  W=$w > e=$E — algedonic emergency firing"
   _write_edge "$id" "algedonic-fired-at-weight" "$w-local-$local_s-inherited-$inh" salt
-  # Stamp the BEARING held at the moment of fire — captured HERE because it
-  # lives in working memory only at fire-time and nowhere after. A later
-  # occasion judges it via `frame perish as receipt "fire-verdict: ..."`;
-  # swarm-memory reads the pair back. This is the fire-feedback loop.
-  # Verdict vocabulary is held|redirected|partial — NOT wrong|right. A
-  # bearing isn't refuted, it's redirected: "I was leaning at the render
-  # layer; the lean itself was the tell I'd stopped looking at module load."
-  # That holds more than a binary, and it doesn't pretend the lean was ever
-  # a clean claim under test.
+  # Stamp the AIM the frame loosed — captured HERE because it lives in working
+  # memory only at fire-time and nowhere after. This is a *bearing* in the
+  # moment (the direction leaned); read backward by a later occasion it is the
+  # *aim* that missed. A fire does not refute a hypothesis (binary, walk-away);
+  # it looses an aim, and an aim is never perfect. The fire is the arrow
+  # landing — but where it struck, and how the aim was off (the hamartia), is
+  # NOT knowable now. That reading belongs to a successor who descends into
+  # this fired frame (`frame down`) and names the miss (`frame hamartia`).
+  # The offer-to-swarm happens THERE, not here: right now this frame is a
+  # wound, not a lesson.
   local held; held=$(held_bearing "$id")
-  _write_edge "$id" "fired-holding-bearing" "$(slugify "$held")" salt
-  echo "   held bearing: $held"
-  echo "   when the real cause is known, judge where this bearing led:"
-  echo "     frame perish as receipt \"fire-verdict: held|redirected|partial — <where it actually led>\""
+  # Store the aim FULL-TEXT (sanitize, not slugify): the aim is the user-story
+  # WHY a later archer must read whole. (Slugifying here re-truncated it even
+  # after cmd_story was fixed — the third and last slug site on the aim's path.)
+  _write_edge "$id" "fired-holding-bearing" "$(sanitize_text "$held")" salt
+  echo "   aim loosed: $held"
+  echo "   later, an archer descends and names the miss:"
+  echo "     frame down \"read where it struck\"   then   frame hamartia \"<how the aim was off>\""
   if [[ -n "$root_id" && "$root_id" != "$id" ]]; then
     _write_edge "$root_id" "received-algedonic-fire" "$id:W=$w:local=$local_s:inherited=$inh" salt
   fi
@@ -389,9 +409,13 @@ cmd_story() {
   [[ -z "$text" ]] && { echo "frame story: need text" >&2; exit 1; }
   local cur; cur=$(current_frame)
   [[ -z "$cur" ]] && { echo "no current frame" >&2; exit 1; }
-  local ts; ts=$(slugify "$text")
-  _write_edge "$cur" "serves-user-story" "$ts" salt
-  echo "story attached to $cur: $ts"
+  # Store the story FULL-TEXT, not slugified: the user story IS the aim, and a
+  # truncated aim is no aim. (Earlier this slugified to a ≤50-char handle, which
+  # mangled the WHY everywhere it was read back — including as a fired frame's
+  # aim.) sanitize_text keeps it TSV-safe without losing words.
+  local st; st=$(sanitize_text "$text")
+  _write_edge "$cur" "serves-user-story" "$st" salt
+  echo "story attached to $cur: $st"
 }
 
 cmd_stories() {
@@ -403,7 +427,10 @@ cmd_stories() {
 _story_walk() {
   local id="$1" indent="$2"
   local story
-  story=$(_find_edges "$id" | grep -oE 'serves-user-story --> [^ )]+' | head -1 | sed 's/.*--> //')
+  # Read the story straight from the TSV ($4, whole field) rather than grepping
+  # the rendered edge string — the old [^ )]+ pattern stopped at the first space
+  # and would show only the first word now that stories are full-text.
+  story=$(story_for "$id")
   if [[ -n "$story" ]]; then
     echo "${indent}└─ ($(frame_type "$id")) $id"
     echo "${indent}    why: $story"
@@ -974,12 +1001,82 @@ _ancestry_walk() {
 _fired_bearing_of() {
   awk -F'\t' -v id="$1" '$2==id && $3=="fired-holding-bearing" {h=$4} END {print h}' "$EDGES"
 }
-# A later occasion's verdict on a fire, recorded as `perish as receipt
-# "fire-verdict: ..."`. Returns the slugified note, or empty if unjudged.
-_fire_verdict_of() {
-  awk -F'\t' -v id="$1" '
-    $2==id && $3=="perished-as-receipt" && $4 ~ /^fire-verdict/ {v=$4}
-    END {print v}' "$EDGES"
+# Did this frame die by fire (W crossed e), as opposed to a considered whelp?
+_frame_fired() {
+  awk -F'\t' -v id="$1" '$2==id && $3=="algedonic-fired-at-weight" {f=1} END {print f+0}' "$EDGES"
+}
+# The hamartia recorded for a frame, if a later occasion has named it.
+_hamartia_of() {
+  awk -F'\t' -v id="$1" '$2==id && $3=="hamartia" {h=$4} END {print h}' "$EDGES"
+}
+# The locus (approach|aim) a later occasion assigned, if any. Often empty —
+# not knowing which broke is a legitimate state, so this is frequently blank.
+_hamartia_locus_of() {
+  awk -F'\t' -v id="$1" '$2==id && $3=="hamartia-locus" {l=$4} END {print l}' "$EDGES"
+}
+
+# frame hamartia <the-flaw-in-the-aim>
+#
+# Record the tragic flaw of a re-entered fired frame — and COMPLETE its
+# perishing by offering it to the swarm.
+#
+# The vocabulary, earned across this design: a fire does not test a
+# *hypothesis* (which would succeed or fail, a binary you walk away from on
+# one miss). A fire looses an *aim* — and an aim is never perfect. The
+# bearing captured at fire-time is the aim; the hamartia is the mark-missed,
+# read backward into the draw by a LATER occasion. You cannot name a
+# hamartia without an aim it missed — which is why this move requires you to
+# be inside a frame that actually fired. The guard is grammatical, not
+# defensive: no aim loosed, no mark to have missed.
+#
+# Crucially, the OFFER to the swarm happens HERE, not in maybe_fire. A fire
+# is an interruption — the system popped the subject out whether ready or
+# not. At that instant the frame is a wound, not a lesson: the aim is known
+# but the windage is not. Offering it then would hand the swarm a bearing
+# with no redirection — the exact false-surety lure this whole design
+# removes. The hamartia-recognition is what turns the wound into memory.
+# So a fired frame becomes swarm-readable only once an archer descends and
+# reads where the arrow struck.
+cmd_hamartia() {
+  # Optional --locus approach|aim. We often DON'T know which broke — that's an
+  # honest state, not a gap to force. So locus is an offering, never a demand:
+  # requiring it would smuggle back the false surety this whole design removed
+  # (a typed "which broke?" is a hypothesis the archer may not have earned).
+  # Default freeform; name the locus only when there's a real read.
+  local locus=""
+  if [[ "${1:-}" == "--locus" ]]; then
+    locus="$2"; shift 2 || true
+    if [[ "$locus" != "approach" && "$locus" != "aim" ]]; then
+      echo "frame hamartia: --locus must be 'approach' (the draw missed; the story was sound)" >&2
+      echo "  or 'aim' (the user story itself needs revising). Omit it if you don't know." >&2
+      exit 1
+    fi
+  fi
+  local flaw="$*"
+  [[ -z "$flaw" ]] && { echo "frame hamartia: need the flaw — how the aim missed" >&2; exit 1; }
+  local cur; cur=$(current_frame)
+  [[ -z "$cur" ]] && { echo "no current frame — frame down into a fired frame first" >&2; exit 1; }
+  if [[ "$(_frame_fired "$cur")" != "1" ]]; then
+    echo "frame hamartia: $cur did not fire — no death here to autopsy." >&2
+    echo "  descend into a fired frame first: frame down <reason>  (or frame switch <fired-id>)" >&2
+    exit 1
+  fi
+  local aim; aim=$(_fired_bearing_of "$cur")
+  local w; w=$(compute_weight "$cur")
+  # Store the hamartia FULL-TEXT (sanitized, not slugified) — a post-mortem you
+  # can't read is no post-mortem. The offers-to-swarm edge stays a stable
+  # marker (its object is parsed for :W=); the readable lesson lives in its own
+  # `hamartia` edge, and the locus, if given, in `hamartia-locus`.
+  _write_edge "$cur" "hamartia" "$(sanitize_text "$flaw")" salt
+  [[ -n "$locus" ]] && _write_edge "$cur" "hamartia-locus" "$locus" salt
+  # The act that completes the perishing: the fired frame, once a private
+  # wound, now offers its lesson to the swarm.
+  _write_edge "$cur" "offers-to-swarm" "fired-aim:W=$w" salt
+  echo "hamartia recorded for $cur:"
+  echo "  aim (loosed):  ${aim:-<no bearing captured>}"
+  [[ -n "$locus" ]] && echo "  locus:         $locus $([ "$locus" = aim ] && echo '(the user story itself needs revising)' || echo '(the draw missed; the story was sound)')"
+  echo "  hamartia:      $flaw"
+  echo "  → perishing complete. now in swarm memory for the next archer."
 }
 
 cmd_swarm_memory() {
@@ -988,20 +1085,27 @@ cmd_swarm_memory() {
   while IFS=$'\t' read -r ts subj pred obj phase; do
     [[ "$pred" == "offers-to-swarm" ]] || continue
     found=1
-    local reason; reason=$(echo "$obj" | sed 's/whelped-because-//; s/:W=.*$//')
     local w; w=$(echo "$obj" | sed -E 's/.*:W=([0-9.]+).*/\1/')
-    printf "  %s\n    whelped: %s  W=%s\n" "$subj" "$reason" "$w"
-    # The fire-feedback loop, read back: what was the bearing, where did it lead?
-    local held verdict
-    held=$(_fired_bearing_of "$subj")
-    verdict=$(_fire_verdict_of "$subj")
-    if [[ -n "$held" ]]; then
-      printf "    fired holding bearing: %s\n" "$held"
-      if [[ -n "$verdict" ]]; then
-        printf "    verdict: %s\n" "${verdict#fire-verdict-}"
+    # Two kinds of death read differently. A fire loosed an aim and missed;
+    # its lesson is the hamartia. A considered whelp chose to stop; its
+    # lesson is the reason. Show each as what it is.
+    local aim hamartia locus
+    aim=$(_fired_bearing_of "$subj")
+    hamartia=$(_hamartia_of "$subj")
+    locus=$(_hamartia_locus_of "$subj")
+    if [[ -n "$aim" ]]; then
+      printf "  %s  (fired — aim missed)\n" "$subj"
+      printf "    aim loosed:  %s  W=%s\n" "$aim" "$w"
+      if [[ -n "$hamartia" ]]; then
+        [[ -n "$locus" ]] && printf "    locus:       %s\n" "$locus"
+        printf "    hamartia:    %s\n" "$hamartia"
       else
-        printf "    verdict: (unjudged — if the real cause is now known: frame perish as receipt \"fire-verdict: ...\")\n"
+        printf "    hamartia:    (unread — descend and name the miss: frame down ... ; frame hamartia \"...\")\n"
       fi
+    else
+      local reason; reason=$(echo "$obj" | sed 's/whelped-because-//; s/:W=.*$//')
+      printf "  %s  (whelped — considered give-up)\n" "$subj"
+      printf "    whelped: %s  W=%s\n" "$reason" "$w"
     fi
     printf "    to prehend: frame prehend %s as warning\n\n" "$subj"
   done < "$EDGES"
@@ -1032,6 +1136,7 @@ case "$cmd" in
   prehend)       cmd_prehend "$@" ;;
   perish)        cmd_perish "$@" ;;
   ancestry)      cmd_ancestry "$@" ;;
+  hamartia)      cmd_hamartia "$@" ;;
   swarm-memory)  cmd_swarm_memory ;;
   resolve)  cmd_resolve "$@" ;;
   whelp)    cmd_whelp "$@" ;;
