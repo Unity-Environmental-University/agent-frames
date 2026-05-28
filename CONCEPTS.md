@@ -11,8 +11,8 @@ Five frame types:
 | Frame | Question | Success criterion | When to use |
 |---|---|---|---|
 | **Step 0** | "How is it going?" | Accurate read | At the start; when disoriented |
-| **F\*ck Around** | "What's interesting here?" | Interestingness, not progress | When lost; when a hypothesis fired and you need fresh data |
-| **Fix** | "Can the thing work?" | Thing works | When you have a hypothesis worth testing |
+| **F\*ck Around** | "What's interesting here?" | Interestingness, not progress | When lost; when a fire popped you off an aim and you need fresh data |
+| **Fix** | "Can the thing work?" | Thing works | When you have an aim worth following |
 | **Chill Vibes** | "Is rest the work?" | Not acting | When the right move is to wait |
 | **Whelp** | "Is this path done?" | Honest acknowledgment | When you've given up — explicitly, with a reason |
 

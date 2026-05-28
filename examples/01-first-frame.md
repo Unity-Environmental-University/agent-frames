@@ -38,7 +38,7 @@ W=0. You have full slack.
 
 ## Make a try; evaluate it honestly
 
-You hypothesize the flaky auth test is a race condition. You re-run it 5 times to confirm flakiness.
+Your aim: the flaky auth test is a race condition. You re-run it 5 times to confirm flakiness.
 
 ```bash
 frame try "rerun-auth-test-5x-to-confirm-flakiness"
@@ -54,7 +54,7 @@ frame eval success "confirmed-flaky-3-of-5-fail-with-different-errors"
 
 Note the note: not just "success" but *what* you learned. The note is for future-you.
 
-## Now a hypothesis: race condition
+## First aim: race condition
 
 ```bash
 frame try "add-explicit-sync-around-auth-token-mutation"
@@ -70,9 +70,9 @@ frame eval strike "still-3-of-10-fail-sync-didnt-help-not-a-race"
 ✗ strike on add-explicit-sync-around-auth-token-mutation (still-3-of-10-fail-sync-didnt-help-not-a-race) → W(...)=1.0000
 ```
 
-W=1. One wrong hypothesis.
+W=1. One aim that missed.
 
-## Second hypothesis: clock drift
+## Second aim: clock drift
 
 ```bash
 frame try "check-if-test-relies-on-system-time-and-mock-it"
@@ -88,7 +88,7 @@ frame eval strike "still-2-of-10-fail-not-clock-related"
 ✗ strike on check-if-test-relies-on-system-time-and-mock-it (still-2-of-10-fail-not-clock-related) → W(...)=2.0000
 ```
 
-W=2. Two wrong hypotheses. You're 73% to the threshold.
+W=2. Two aims that missed. You're 73% to the threshold.
 
 Run `frame in`:
 
@@ -122,7 +122,7 @@ Let's try option 2.
 
 ## Step into a Circle for regulation
 
-First, eval the pending try as a strike — you didn't actually test the DB hypothesis, you were just about to:
+First, eval the pending try as a strike — you didn't actually test the DB aim, you were just about to:
 
 ```bash
 frame eval strike "didnt-actually-test-just-second-guessing"
@@ -136,7 +136,7 @@ frame eval strike "didnt-actually-test-just-second-guessing"
 
 **The frame auto-fired.** You crossed `e`. The mechanism popped you out.
 
-This is the gift. You were about to spend an hour on a database hypothesis you hadn't even tested. The system stopped you.
+This is the gift. You were about to spend an hour on a database aim you hadn't even tested. The system stopped you.
 
 ## Restart fresh — this time with a Circle first
 
@@ -167,7 +167,7 @@ Three tangents — the circle warns, but doesn't auto-fire. You're still in cont
 frame ready "test-uses-timezone-aware-comparison-and-DST-just-ended"
 ```
 
-The circle resolves. Now a fresh Fix with the right hypothesis:
+The circle resolves. Now a fresh Fix with the right aim:
 
 ```bash
 frame try "patch-test-to-use-UTC-explicitly"
@@ -192,7 +192,7 @@ resolved root frame-debug-flaky-test-take-2-... (flaky-auth-test-fixed-was-DST-t
 
 You used the system on a real-shape problem:
 
-- **The fire saved you** from a third strike on the wrong hypothesis
+- **The fire saved you** from a third strike on an aim that wasn't landing
 - **The circle let you regulate** before another swing — found the real signal in a tangent
 - **The perish typed the legacy** so future readers know to check timezone comparisons in flaky tests
 
@@ -200,7 +200,7 @@ That's the loop. The mechanism is doing real work, not bookkeeping.
 
 ## Try it on your own next real problem
 
-The next time you sit down to debug something where you suspect you'll chase 2+ wrong hypotheses, open a frame:
+The next time you sit down to debug something where you suspect you'll take aim 2+ times and miss, open a frame:
 
 ```bash
 frame root fix "<short-description>"

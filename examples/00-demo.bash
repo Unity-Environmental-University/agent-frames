@@ -47,7 +47,7 @@ do_cmd in
 note "The bar shows accumulated weight. local + inherited = total."
 pause
 
-say "4. Take a tight swing — second hypothesis"
+say "4. Take a tight swing — second aim"
 do_cmd try "check-for-shared-state-between-tests"
 do_cmd eval strike "no-shared-state-found-still-flaky"
 do_cmd in

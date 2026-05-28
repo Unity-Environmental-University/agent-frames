@@ -49,14 +49,14 @@ pause
 say "4. Alice and bob take a strike each. Carol is fine."
 SK_A="worker-$SWARM-alice"
 SK_B="worker-$SWARM-bob"
-AGENT_FRAMES_SESSION="$SK_A" "$FRAME" strike "alice-first-hypothesis-wrong" >/dev/null
-AGENT_FRAMES_SESSION="$SK_B" "$FRAME" strike "bob-first-hypothesis-wrong" >/dev/null
+AGENT_FRAMES_SESSION="$SK_A" "$FRAME" strike "alice-first-aim-missed" >/dev/null
+AGENT_FRAMES_SESSION="$SK_B" "$FRAME" strike "bob-first-aim-missed" >/dev/null
 "$OVERLORD" field
 note "Alice and bob at W=1.0. Carol still 0. Swarm-W (max): $("$OVERLORD" swarm-w)"
 pause
 
 say "5. Alice takes a second strike — getting close to threshold"
-AGENT_FRAMES_SESSION="$SK_A" "$FRAME" strike "alice-second-hypothesis-also-wrong" >/dev/null
+AGENT_FRAMES_SESSION="$SK_A" "$FRAME" strike "alice-second-aim-also-missed" >/dev/null
 "$OVERLORD" field
 note "Alice at W=2.0 (73% of e). Swarm-W now: $("$OVERLORD" swarm-w)"
 pause

@@ -1,6 +1,6 @@
 # agent-frames
 
-A small command-line tool for tracking debugging and design work as a stack of **subject-positions** — perspectives like "I'm exploring", "I'm trying to fix this", "I'm regulating before a hard attempt" — with a built-in stop condition that fires when you've sunk too much into the wrong hypothesis.
+A small command-line tool for tracking debugging and design work as a stack of **subject-positions** — perspectives like "I'm exploring", "I'm trying to fix this", "I'm regulating before a hard attempt" — with a built-in stop condition that fires when you've sunk too much into an aim that isn't landing.
 
 In one line: a state machine for staying honest about how stuck you are.
 
@@ -16,7 +16,7 @@ bash examples/00-demo.bash
 
 ## Why this exists
 
-You're debugging a flaky test. Your first hypothesis is wrong, your second hypothesis is wrong, you keep refining the same wrong frame because each adjustment feels like progress. Two hours later you discover the bug was in a completely different layer.
+You're debugging a flaky test. Your first aim misses, your second aim misses, you keep refining the same wrong frame because each adjustment feels like progress. Two hours later you discover the bug was in a completely different layer.
 
 This is normal. It's also avoidable. The pattern is:
 
@@ -54,7 +54,7 @@ See [INSTALL.md](INSTALL.md) for more options.
 
 ## When to use it
 
-- You're about to debug something where you'll likely chase 2+ wrong hypotheses
+- You're about to debug something where you'll likely take aim 2+ times and miss
 - You're spawning sub-agents (Claude Code Task tool, etc.) on work that could fail in non-obvious ways
 - You've noticed you have a habit of giving up too early *or* burning too much time on the wrong path
 - You want a graph of how you arrived at a fix that survives the session
