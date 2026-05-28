@@ -198,6 +198,30 @@ last_unevaluated_try() {
   awk -F'\t' -v id="$1" '$1==id && $4=="unevaluated" {ts=$2; act=$3} END {if(ts) print ts "\t" act}' "$TRIES"
 }
 
+# The BEARING a frame was holding, for stamping onto a fire.
+# Deliberately NOT "hypothesis": a hypothesis is a propositional capture
+# ("the cause IS X") — a lure to false surety that Newton himself recoiled
+# at (hypotheses non fingo). What a frame actually holds at fire-time is a
+# *bearing*: the direction it was leaning, the lure it was following. In a
+# substance metaphysics this is Whitehead's propositional FEELING, not the
+# proposition abstracted out of it. Recording it as a bearing means a later
+# occasion can read what it was like to lean that way — and can record that
+# the lean was REDIRECTED, not merely "refuted". The fire is a perishing;
+# the bearing is its objective datum.
+# Story wins (frame-level, named on purpose); falls back to the most recent
+# try (action-level, what was in hand). Never empty — a fire with no captured
+# bearing can't be judged later, which would defeat the whole verdict loop.
+story_for() {
+  awk -F'\t' -v id="$1" '$2==id && $3=="serves-user-story" {s=$4} END {print s}' "$EDGES"
+}
+held_bearing() {
+  local id="$1" s last
+  s=$(story_for "$id")
+  if [[ -n "$s" ]]; then echo "$s"; return; fi
+  last=$(awk -F'\t' -v id="$id" '$1==id {act=$3} END {print act}' "$TRIES")
+  echo "${last:-no-bearing-recorded}"
+}
+
 set_try_state() { # id ts new-state
   local id="$1" ts="$2" st="$3" tmp
   tmp=$(mktemp)
@@ -224,11 +248,32 @@ maybe_fire() {
   root_id=$(root_frame)
   echo "⚠  W=$w > e=$E — algedonic emergency firing"
   _write_edge "$id" "algedonic-fired-at-weight" "$w-local-$local_s-inherited-$inh" salt
+  # Stamp the BEARING held at the moment of fire — captured HERE because it
+  # lives in working memory only at fire-time and nowhere after. A later
+  # occasion judges it via `frame perish as receipt "fire-verdict: ..."`;
+  # swarm-memory reads the pair back. This is the fire-feedback loop.
+  # Verdict vocabulary is held|redirected|partial — NOT wrong|right. A
+  # bearing isn't refuted, it's redirected: "I was leaning at the render
+  # layer; the lean itself was the tell I'd stopped looking at module load."
+  # That holds more than a binary, and it doesn't pretend the lean was ever
+  # a clean claim under test.
+  local held; held=$(held_bearing "$id")
+  _write_edge "$id" "fired-holding-bearing" "$(slugify "$held")" salt
+  echo "   held bearing: $held"
+  echo "   when the real cause is known, judge where this bearing led:"
+  echo "     frame perish as receipt \"fire-verdict: held|redirected|partial — <where it actually led>\""
   if [[ -n "$root_id" && "$root_id" != "$id" ]]; then
     _write_edge "$root_id" "received-algedonic-fire" "$id:W=$w:local=$local_s:inherited=$inh" salt
   fi
   # auto-whelp
   _write_edge "$id" "whelped-because" "weight-exceeded-e-threshold" salt
+  # WATCH (not fix, per Hallie 2026-05-28): a fire auto-whelps but does NOT
+  # write `offers-to-swarm`, so a fired frame's captured bearing/verdict is
+  # currently unreachable from `swarm-memory` (only manual `whelp` offers to
+  # the swarm). The fires are arguably the deaths MOST worth remembering, so
+  # this asymmetry is a real strain — left legible on purpose rather than
+  # closed, so the shape stays visible to the next reader. Closing it is a
+  # one-line `_write_edge "$id" "offers-to-swarm" ...` here, when it's time.
   set_state "$id" "whelped"
   local parent
   parent=$(frame_parent "$id")
@@ -925,6 +970,18 @@ _ancestry_walk() {
   done <<< "$lines"
 }
 
+# The bearing a frame fired holding (empty if it whelped without firing).
+_fired_bearing_of() {
+  awk -F'\t' -v id="$1" '$2==id && $3=="fired-holding-bearing" {h=$4} END {print h}' "$EDGES"
+}
+# A later occasion's verdict on a fire, recorded as `perish as receipt
+# "fire-verdict: ..."`. Returns the slugified note, or empty if unjudged.
+_fire_verdict_of() {
+  awk -F'\t' -v id="$1" '
+    $2==id && $3=="perished-as-receipt" && $4 ~ /^fire-verdict/ {v=$4}
+    END {print v}' "$EDGES"
+}
+
 cmd_swarm_memory() {
   echo "== swarm memory (whelped frames offering learning) =="
   local found=0
@@ -933,8 +990,20 @@ cmd_swarm_memory() {
     found=1
     local reason; reason=$(echo "$obj" | sed 's/whelped-because-//; s/:W=.*$//')
     local w; w=$(echo "$obj" | sed -E 's/.*:W=([0-9.]+).*/\1/')
-    printf "  %s\n    whelped: %s  W=%s\n    to prehend: frame prehend %s as warning\n\n" \
-      "$subj" "$reason" "$w" "$subj"
+    printf "  %s\n    whelped: %s  W=%s\n" "$subj" "$reason" "$w"
+    # The fire-feedback loop, read back: what was the bearing, where did it lead?
+    local held verdict
+    held=$(_fired_bearing_of "$subj")
+    verdict=$(_fire_verdict_of "$subj")
+    if [[ -n "$held" ]]; then
+      printf "    fired holding bearing: %s\n" "$held"
+      if [[ -n "$verdict" ]]; then
+        printf "    verdict: %s\n" "${verdict#fire-verdict-}"
+      else
+        printf "    verdict: (unjudged — if the real cause is now known: frame perish as receipt \"fire-verdict: ...\")\n"
+      fi
+    fi
+    printf "    to prehend: frame prehend %s as warning\n\n" "$subj"
   done < "$EDGES"
   [[ "$found" -eq 0 ]] && echo "  (none — swarm has no whelp memory yet)"
 }
